@@ -11,7 +11,7 @@ from uuid import uuid4
 import httpx
 
 from app.core.config import settings
-from app.schemas import IngestionSource, SourceEvent
+from app.schemas import GoogleMockSourceType, IngestionSource, SourceEvent
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
@@ -95,6 +95,22 @@ class GoogleOAuthConnector:
         source_events.extend(self._to_gmail_events(context=context, messages=gmail_messages))
         source_events.extend(self._to_calendar_events(context=context, events=calendar_events))
         return source_events
+
+    def handle_mock_callback(
+        self,
+        *,
+        context: GoogleOAuthContext,
+        source_type: GoogleMockSourceType,
+        payload: dict[str, Any],
+    ) -> list[SourceEvent]:
+        if source_type == GoogleMockSourceType.CONTACTS:
+            contacts = self._normalize_contacts_payload(payload)
+            return self._to_contact_events(context=context, contacts=contacts)
+        if source_type == GoogleMockSourceType.GMAIL:
+            messages = self._normalize_gmail_payload(payload)
+            return self._to_gmail_events(context=context, messages=messages)
+        events = self._normalize_calendar_payload(payload)
+        return self._to_calendar_events(context=context, events=events)
 
     async def _exchange_code_for_token(self, *, code: str) -> str:
         if (
@@ -185,6 +201,31 @@ class GoogleOAuthConnector:
             raise GoogleConnectorError(f"Failed to fetch calendar events: {response.status_code}.")
         return response.json().get("items", [])
 
+    def _normalize_contacts_payload(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if "connections" in payload and isinstance(payload["connections"], list):
+            return payload["connections"]
+        if "contacts" in payload and isinstance(payload["contacts"], list):
+            return payload["contacts"]
+        if payload:
+            return [payload]
+        raise GoogleConnectorError("Mock contacts payload must contain 'connections' or contact object data.")
+
+    def _normalize_gmail_payload(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if "messages" in payload and isinstance(payload["messages"], list):
+            return payload["messages"]
+        if payload:
+            return [payload]
+        raise GoogleConnectorError("Mock gmail payload must contain 'messages' or message object data.")
+
+    def _normalize_calendar_payload(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if "items" in payload and isinstance(payload["items"], list):
+            return payload["items"]
+        if "events" in payload and isinstance(payload["events"], list):
+            return payload["events"]
+        if payload:
+            return [payload]
+        raise GoogleConnectorError("Mock calendar payload must contain 'items' or event object data.")
+
     def _to_contact_events(
         self,
         *,
@@ -261,4 +302,3 @@ class GoogleOAuthConnector:
                 )
             )
         return output
-

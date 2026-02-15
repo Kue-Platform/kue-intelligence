@@ -11,6 +11,7 @@ from app.ingestion.google_connector import (
     resolve_google_state,
 )
 from app.schemas import (
+    GoogleOAuthMockCallbackRequest,
     GoogleOAuthCallbackResponse,
     IngestionMockTriggerRequest,
     IngestionMockTriggerResponse,
@@ -78,6 +79,40 @@ async def google_oauth_callback(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Google connector failure: {exc}") from exc
+
+    counts = Counter(str(event.source) for event in source_events)
+    return GoogleOAuthCallbackResponse(
+        tenant_id=resolved_tenant_id,
+        user_id=resolved_user_id,
+        trace_id=trace_id,
+        source_events=source_events,
+        counts=dict(counts),
+    )
+
+
+@router.post("/google/oauth/callback/mock", response_model=GoogleOAuthCallbackResponse)
+async def google_oauth_callback_mock(
+    request: GoogleOAuthMockCallbackRequest,
+    connector: GoogleOAuthConnector = Depends(get_google_connector),
+) -> GoogleOAuthCallbackResponse:
+    try:
+        resolved_tenant_id, resolved_user_id = resolve_google_state(
+            state=request.state,
+            tenant_id=request.tenant_id,
+            user_id=request.user_id,
+        )
+        trace_id = request.trace_id or f"trace_{uuid4().hex}"
+        source_events = connector.handle_mock_callback(
+            context=GoogleOAuthContext(
+                tenant_id=resolved_tenant_id,
+                user_id=resolved_user_id,
+                trace_id=trace_id,
+            ),
+            source_type=request.source_type,
+            payload=request.payload,
+        )
+    except GoogleConnectorError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     counts = Counter(str(event.source) for event in source_events)
     return GoogleOAuthCallbackResponse(

@@ -44,6 +44,7 @@ celery -A app.celery_app.celery_app worker --loglevel=info
 - `GET /v1/jobs/{task_id}`: fetch Celery task status/result.
 - `POST /v1/ingestion/mock`: trigger mock source connector inputs (`google_contacts`, `gmail`, `linkedin`).
 - `GET /v1/ingestion/google/oauth/callback`: complete Google OAuth callback and emit normalized source events for contacts, gmail, and calendar.
+- `POST /v1/ingestion/google/oauth/callback/mock`: send mock Google API payloads and run callback normalization logic without real OAuth exchange.
 
 ### Layer 1 Test Endpoint Example
 
@@ -72,6 +73,23 @@ Response includes `source_events` in this shape:
 - `source_event_id`
 - `occurred_at`
 - `trace_id`
+
+### Google OAuth Callback Mock Example
+
+```bash
+curl -X POST http://localhost:8000/v1/ingestion/google/oauth/callback/mock \
+  -H "Content-Type: application/json" \
+  -d '{
+    "source_type": "contacts",
+    "tenant_id": "tenant_123",
+    "user_id": "user_123",
+    "payload": {
+      "connections": [
+        {"resourceName": "people/c_1", "names": [{"displayName": "Alan Turing"}]}
+      ]
+    }
+  }'
+```
 
 ## Run Tests
 

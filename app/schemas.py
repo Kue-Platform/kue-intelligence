@@ -74,3 +74,21 @@ class GoogleOAuthCallbackResponse(BaseModel):
     trace_id: str
     source_events: list[SourceEvent]
     counts: dict[str, int]
+
+
+class GoogleMockSourceType(StrEnum):
+    CONTACTS = "contacts"
+    GMAIL = "gmail"
+    CALENDAR = "calendar"
+
+
+class GoogleOAuthMockCallbackRequest(BaseModel):
+    source_type: GoogleMockSourceType
+    payload: dict[str, Any] = Field(
+        ...,
+        description="Raw mock payload as returned by Google API for the selected source_type.",
+    )
+    tenant_id: str | None = None
+    user_id: str | None = None
+    state: str | None = None
+    trace_id: str | None = None
