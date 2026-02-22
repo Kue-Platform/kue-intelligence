@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from threading import Lock
+from typing import Any
+
+import httpx
+
+from app.core.config import Settings
+from app.schemas import IngestionSource, RawCapturedEvent, SourceEvent
+
+
+@dataclass
+class RawCaptureResult:
+    stored_count: int
+    captured_at: datetime
+
+
+def _parse_iso_datetime(value: str) -> datetime:
+    normalized = value.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(normalized)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+class RawEventStore(ABC):
+    @property
+    @abstractmethod
+    def store_name(self) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def persist_source_events(self, events: list[SourceEvent]) -> RawCaptureResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_by_trace_id(self, trace_id: str) -> list[RawCapturedEvent]:
+        raise NotImplementedError
+
+
+class SqliteRawEventStore(RawEventStore):
+    def __init__(self, db_path: str) -> None:
+        self._db_path = db_path
+        self._lock = Lock()
+        self._ensure_db()
+
+    @property
+    def store_name(self) -> str:
+        return f"sqlite:{self._db_path}"
+
+    def _ensure_db(self) -> None:
+        target = Path(self._db_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS raw_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tenant_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_event_id TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    trace_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    captured_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_raw_events_trace_id ON raw_events(trace_id)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_raw_events_tenant_source "
+                "ON raw_events(tenant_id, source, occurred_at)"
+            )
+            conn.commit()
+
+    def persist_source_events(self, events: list[SourceEvent]) -> RawCaptureResult:
+        if not events:
+            captured_at = datetime.now(UTC)
+            return RawCaptureResult(stored_count=0, captured_at=captured_at)
+
+        captured_at = datetime.now(UTC)
+        rows = [
+            (
+                event.tenant_id,
+                event.user_id,
+                str(event.source),
+                event.source_event_id,
+                event.occurred_at.isoformat(),
+                event.trace_id,
+                json.dumps(event.payload, ensure_ascii=True),
+                captured_at.isoformat(),
+            )
+            for event in events
+        ]
+        with self._lock:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO raw_events (
+                        tenant_id, user_id, source, source_event_id, occurred_at,
+                        trace_id, payload_json, captured_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                conn.commit()
+        return RawCaptureResult(stored_count=len(rows), captured_at=captured_at)
+
+    def list_by_trace_id(self, trace_id: str) -> list[RawCapturedEvent]:
+        with self._lock:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    """
+                    SELECT id, tenant_id, user_id, source, source_event_id,
+                           occurred_at, trace_id, payload_json, captured_at
+                    FROM raw_events
+                    WHERE trace_id = ?
+                    ORDER BY id ASC
+                    """,
+                    (trace_id,),
+                )
+                rows = cursor.fetchall()
+
+        events: list[RawCapturedEvent] = []
+        for row in rows:
+            events.append(
+                RawCapturedEvent(
+                    raw_event_id=int(row["id"]),
+                    tenant_id=str(row["tenant_id"]),
+                    user_id=str(row["user_id"]),
+                    source=IngestionSource(str(row["source"])),
+                    source_event_id=str(row["source_event_id"]),
+                    occurred_at=_parse_iso_datetime(str(row["occurred_at"])),
+                    trace_id=str(row["trace_id"]),
+                    payload=json.loads(str(row["payload_json"])),
+                    captured_at=_parse_iso_datetime(str(row["captured_at"])),
+                )
+            )
+        return events
+
+
+class SupabaseRawEventStore(RawEventStore):
+    def __init__(self, *, supabase_url: str, api_key: str, table: str) -> None:
+        self._supabase_url = supabase_url.rstrip("/")
+        self._api_key = api_key
+        self._table = table
+        self._base_headers = {
+            "apikey": self._api_key,
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+
+    @property
+    def store_name(self) -> str:
+        return f"supabase:{self._table}"
+
+    def _rest_url(self) -> str:
+        return f"{self._supabase_url}/rest/v1/{self._table}"
+
+    def persist_source_events(self, events: list[SourceEvent]) -> RawCaptureResult:
+        if not events:
+            captured_at = datetime.now(UTC)
+            return RawCaptureResult(stored_count=0, captured_at=captured_at)
+
+        captured_at = datetime.now(UTC)
+        payload: list[dict[str, Any]] = []
+        for event in events:
+            payload.append(
+                {
+                    "tenant_id": event.tenant_id,
+                    "user_id": event.user_id,
+                    "source": str(event.source),
+                    "source_event_id": event.source_event_id,
+                    "occurred_at": event.occurred_at.isoformat(),
+                    "trace_id": event.trace_id,
+                    "payload_json": event.payload,
+                    "captured_at": captured_at.isoformat(),
+                }
+            )
+
+        headers = dict(self._base_headers)
+        headers["Prefer"] = "return=minimal"
+        response = httpx.post(self._rest_url(), headers=headers, json=payload, timeout=20.0)
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Supabase raw event insert failed ({response.status_code}): {response.text}"
+            )
+        return RawCaptureResult(stored_count=len(payload), captured_at=captured_at)
+
+    def list_by_trace_id(self, trace_id: str) -> list[RawCapturedEvent]:
+        params = {
+            "trace_id": f"eq.{trace_id}",
+            "order": "id.asc",
+        }
+        response = httpx.get(
+            self._rest_url(),
+            headers=self._base_headers,
+            params=params,
+            timeout=20.0,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Supabase raw event query failed ({response.status_code}): {response.text}"
+            )
+
+        rows = response.json()
+        events: list[RawCapturedEvent] = []
+        for row in rows:
+            payload = row.get("payload_json")
+            if isinstance(payload, str):
+                decoded_payload = json.loads(payload)
+            else:
+                decoded_payload = payload or {}
+            events.append(
+                RawCapturedEvent(
+                    raw_event_id=int(row.get("id", 0)),
+                    tenant_id=str(row["tenant_id"]),
+                    user_id=str(row["user_id"]),
+                    source=IngestionSource(str(row["source"])),
+                    source_event_id=str(row["source_event_id"]),
+                    occurred_at=_parse_iso_datetime(str(row["occurred_at"])),
+                    trace_id=str(row["trace_id"]),
+                    payload=decoded_payload,
+                    captured_at=_parse_iso_datetime(str(row["captured_at"])),
+                )
+            )
+        return events
+
+
+def create_raw_event_store(settings: Settings) -> RawEventStore:
+    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
+        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
+        return SupabaseRawEventStore(
+            supabase_url=settings.supabase_url,
+            api_key=api_key,
+            table=settings.supabase_raw_events_table,
+        )
+    return SqliteRawEventStore(db_path=settings.raw_events_db_path)
+

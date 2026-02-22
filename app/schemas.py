@@ -6,27 +6,13 @@ from enum import StrEnum
 from pydantic import BaseModel, Field
 
 
-class AnalyzeDataRequest(BaseModel):
-    values: list[float] = Field(..., min_length=1, description="Numeric values to analyze")
-
-
-class JobCreatedResponse(BaseModel):
-    task_id: str
-    status: str
-
-
-class JobStatusResponse(BaseModel):
-    task_id: str
-    status: str
-    result: dict[str, Any] | None = None
-    error: str | None = None
-
-
 class IngestionSource(StrEnum):
     GOOGLE_CONTACTS = "google_contacts"
     GMAIL = "gmail"
     GOOGLE_CALENDAR = "google_calendar"
     LINKEDIN = "linkedin"
+    TWITTER = "twitter"
+    CSV_IMPORT = "csv_import"
 
 
 class ConnectorTriggerType(StrEnum):
@@ -67,6 +53,18 @@ class SourceEvent(BaseModel):
     payload: dict[str, Any]
 
 
+class RawCapturedEvent(BaseModel):
+    raw_event_id: int
+    tenant_id: str
+    user_id: str
+    source: IngestionSource
+    source_event_id: str
+    occurred_at: datetime
+    trace_id: str
+    payload: dict[str, Any]
+    captured_at: datetime
+
+
 class GoogleOAuthCallbackResponse(BaseModel):
     provider: str = "google"
     tenant_id: str
@@ -74,6 +72,9 @@ class GoogleOAuthCallbackResponse(BaseModel):
     trace_id: str
     source_events: list[SourceEvent]
     counts: dict[str, int]
+    pipeline_event_name: str
+    pipeline_event_id: str | None = None
+    pipeline_status: str = "accepted"
 
 
 class GoogleMockSourceType(StrEnum):
@@ -92,3 +93,69 @@ class GoogleOAuthMockCallbackRequest(BaseModel):
     user_id: str | None = None
     state: str | None = None
     trace_id: str | None = None
+
+
+class Layer2ManualCaptureRequest(BaseModel):
+    source_events: list[SourceEvent] = Field(..., min_length=1)
+
+
+class RawEventsByTraceResponse(BaseModel):
+    trace_id: str
+    total: int
+    events: list[RawCapturedEvent]
+
+
+class CanonicalEventType(StrEnum):
+    CONTACT = "contact"
+    EMAIL_MESSAGE = "email_message"
+    CALENDAR_EVENT = "calendar_event"
+
+
+class CanonicalEvent(BaseModel):
+    raw_event_id: int
+    tenant_id: str
+    user_id: str
+    trace_id: str
+    source: IngestionSource
+    source_event_id: str
+    occurred_at: datetime
+    event_type: CanonicalEventType
+    normalized: dict[str, Any]
+    parse_warnings: list[str] = []
+
+
+class CanonicalParseFailure(BaseModel):
+    raw_event_id: int
+    source_event_id: str
+    reason: str
+
+
+class Layer3PersistenceSummary(BaseModel):
+    stored_count: int
+    store: str
+    parser_version: str
+    parsed_at: datetime
+
+
+class Layer3ParseResponse(BaseModel):
+    trace_id: str
+    total_raw_events: int
+    parsed_count: int
+    failed_count: int
+    parsed_events: list[CanonicalEvent]
+    failures: list[CanonicalParseFailure]
+    persistence: Layer3PersistenceSummary | None = None
+
+
+class Layer3EventsResponse(BaseModel):
+    trace_id: str
+    total: int
+    events: list[CanonicalEvent]
+
+
+class PipelineRunResponse(BaseModel):
+    run_id: str | None = None
+    event_name: str
+    event_id: str | None = None
+    trace_id: str
+    status: str = "accepted"

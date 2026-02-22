@@ -1,46 +1,10 @@
 import base64
 import json
-from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 
-from app.api.ingestion_routes import get_google_connector
+from app.api.ingestion_routes import get_inngest_dispatcher
 from app.main import app
-from app.schemas import IngestionSource, SourceEvent
-
-
-class _FakeGoogleConnector:
-    async def handle_callback(self, *, code: str, context):  # type: ignore[no-untyped-def]
-        assert code == "auth_code_123"
-        return [
-            SourceEvent(
-                tenant_id=context.tenant_id,
-                user_id=context.user_id,
-                source=IngestionSource.GOOGLE_CONTACTS,
-                source_event_id="people/c123",
-                occurred_at=datetime.now(UTC),
-                trace_id=context.trace_id,
-                payload={"resourceName": "people/c123"},
-            ),
-            SourceEvent(
-                tenant_id=context.tenant_id,
-                user_id=context.user_id,
-                source=IngestionSource.GMAIL,
-                source_event_id="msg_123",
-                occurred_at=datetime.now(UTC),
-                trace_id=context.trace_id,
-                payload={"id": "msg_123"},
-            ),
-            SourceEvent(
-                tenant_id=context.tenant_id,
-                user_id=context.user_id,
-                source=IngestionSource.GOOGLE_CALENDAR,
-                source_event_id="cal_123",
-                occurred_at=datetime.now(UTC),
-                trace_id=context.trace_id,
-                payload={"id": "cal_123"},
-            ),
-        ]
 
 
 def _state(tenant_id: str, user_id: str) -> str:
@@ -49,7 +13,7 @@ def _state(tenant_id: str, user_id: str) -> str:
 
 
 def test_google_oauth_callback_success_query_tenant_user() -> None:
-    app.dependency_overrides[get_google_connector] = lambda: _FakeGoogleConnector()
+    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher("evt_stage_123")
     client = TestClient(app)
 
     response = client.get(
@@ -67,14 +31,15 @@ def test_google_oauth_callback_success_query_tenant_user() -> None:
     assert body["provider"] == "google"
     assert body["tenant_id"] == "tenant_1"
     assert body["user_id"] == "user_1"
-    assert body["counts"]["google_contacts"] == 1
-    assert body["counts"]["gmail"] == 1
-    assert body["counts"]["google_calendar"] == 1
-    assert len(body["source_events"]) == 3
+    assert body["counts"] == {}
+    assert body["source_events"] == []
+    assert body["pipeline_event_name"] == "kue/user.connected"
+    assert body["pipeline_event_id"] == "evt_stage_123"
+    assert body["pipeline_status"] == "accepted"
 
 
 def test_google_oauth_callback_success_state_resolution() -> None:
-    app.dependency_overrides[get_google_connector] = lambda: _FakeGoogleConnector()
+    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher("evt_stage_abc")
     client = TestClient(app)
 
     response = client.get(
@@ -90,6 +55,7 @@ def test_google_oauth_callback_success_state_resolution() -> None:
     body = response.json()
     assert body["tenant_id"] == "tenant_a"
     assert body["user_id"] == "user_a"
+    assert body["pipeline_event_id"] == "evt_stage_abc"
 
 
 def test_google_oauth_callback_missing_identity_context() -> None:
@@ -101,3 +67,9 @@ def test_google_oauth_callback_missing_identity_context() -> None:
     assert response.status_code == 400
     assert "tenant_id/user_id" in response.json()["detail"]
 
+
+def _fake_dispatcher(event_id: str):
+    async def _dispatch(_: str, __: dict) -> str:
+        return event_id
+
+    return _dispatch

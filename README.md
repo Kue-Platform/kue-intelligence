@@ -1,12 +1,10 @@
 # kue-intelligence
 
-AI/Data service scaffold built with Python 3.11+, FastAPI, Celery, Upstash Redis, pandas/numpy, and pytest.
+AI/Data service scaffold built with Python 3.11+, FastAPI, staged ingestion orchestration, Supabase, and pytest.
 
 ## Stack
 - API: FastAPI
-- Async workers: Celery
-- Queue/Result store: Redis (Upstash-compatible)
-- Data processing: pandas + numpy
+- Orchestration events: Inngest
 - Testing: pytest
 
 ## Quick Start
@@ -24,7 +22,7 @@ pip install -e ".[dev]"
 cp .env.example .env
 ```
 
-4. Update `.env` with your Upstash Redis URL.
+4. Update `.env` with your Supabase + Inngest settings.
 
 5. Start API:
 
@@ -32,19 +30,18 @@ cp .env.example .env
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-6. Start Celery worker:
-
-```bash
-celery -A app.celery_app.celery_app worker --loglevel=info
-```
+6. Ensure your Inngest event key is configured to stream stage/layer execution events.
 
 ## API Endpoints
 - `GET /health`: health check.
-- `POST /v1/jobs/analyze`: enqueue numeric analysis task.
-- `GET /v1/jobs/{task_id}`: fetch Celery task status/result.
 - `POST /v1/ingestion/mock`: trigger mock source connector inputs (`google_contacts`, `gmail`, `linkedin`).
-- `GET /v1/ingestion/google/oauth/callback`: complete Google OAuth callback and emit normalized source events for contacts, gmail, and calendar.
-- `POST /v1/ingestion/google/oauth/callback/mock`: send mock Google API payloads and run callback normalization logic without real OAuth exchange.
+- `GET /v1/ingestion/google/oauth/callback`: receive Google callback and emit `kue/user.connected` event.
+- `POST /v1/ingestion/google/oauth/callback/mock`: emit `kue/user.mock_connected` event.
+- `GET /v1/ingestion/raw-events/{trace_id}`: fetch Layer 2 captured raw events by trace id.
+- `POST /v1/ingestion/layer2/capture`: run stage pipeline from explicit source events.
+- `POST /v1/ingestion/layer3/parse/{trace_id}`: dispatch canonicalization replay in Inngest.
+- `POST /v1/ingestion/stage/canonicalization/replay/{trace_id}`: replay canonicalization stage.
+- `GET /v1/ingestion/layer3/events/{trace_id}`: fetch persisted Layer 3 canonical events by trace id.
 
 ### Layer 1 Test Endpoint Example
 
@@ -66,13 +63,22 @@ curl -X POST http://localhost:8000/v1/ingestion/mock \
 curl "http://localhost:8000/v1/ingestion/google/oauth/callback?code=<google_auth_code>&tenant_id=tenant_123&user_id=user_123"
 ```
 
-Response includes `source_events` in this shape:
-- `tenant_id`
-- `user_id`
-- `source`
-- `source_event_id`
-- `occurred_at`
-- `trace_id`
+Callbacks emit Inngest events and Inngest functions execute stage orchestration:
+- `kue/user.connected` (real OAuth path)
+- `kue/user.mock_connected` (mock path)
+
+Inngest function then performs:
+- intake fetch from Google APIs (or mock payload adaptation)
+- `stage.raw_capture` (validate + persist raw events)
+- `stage.canonicalization` (fetch raw + parse + persist canonical)
+
+Each stage emits Inngest events:
+- `pipeline.run.started|completed|failed`
+- `stage.raw_capture.started|completed`
+- `stage.canonicalization.started|completed`
+- `*.layer.started|completed` for layer-level visibility
+
+Inngest functions are served from this API app via `inngest.fast_api.serve(...)`.
 
 ### Google OAuth Callback Mock Example
 
@@ -95,4 +101,47 @@ curl -X POST http://localhost:8000/v1/ingestion/google/oauth/callback/mock \
 
 ```bash
 pytest
+```
+
+## Supabase Table (Layer 2)
+
+Create this table in Supabase for raw capture:
+
+```sql
+create table if not exists public.raw_events (
+  id bigserial primary key,
+  tenant_id text not null,
+  user_id text not null,
+  source text not null,
+  source_event_id text not null,
+  occurred_at timestamptz not null,
+  trace_id text not null,
+  payload_json jsonb not null,
+  captured_at timestamptz not null default now()
+);
+
+create index if not exists idx_raw_events_trace_id on public.raw_events(trace_id);
+create index if not exists idx_raw_events_tenant_source on public.raw_events(tenant_id, source, occurred_at);
+```
+
+## Supabase Table (Layer 3)
+
+Create this table in Supabase for parsed canonical storage:
+
+```sql
+create table if not exists public.canonical_events (
+  id bigserial primary key,
+  raw_event_id bigint not null,
+  tenant_id text not null,
+  user_id text not null,
+  trace_id text not null,
+  source text not null,
+  source_event_id text not null,
+  occurred_at timestamptz not null,
+  event_type text not null,
+  normalized_json jsonb not null,
+  parse_warnings_json jsonb not null default '[]'::jsonb,
+  parser_version text not null,
+  parsed_at timestamptz not null default now()
+);
 ```
