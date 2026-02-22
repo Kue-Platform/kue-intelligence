@@ -13,16 +13,25 @@ from app.ingestion.google_connector import (
     GoogleConnectorError,
     resolve_google_state,
 )
+from app.ingestion.pipeline_store import PipelineStore, create_pipeline_store
 from app.ingestion.raw_store import RawEventStore
 from app.ingestion.raw_store import create_raw_event_store
 from app.inngest.runtime import inngest_client
+from app.ingestion.parsers import parse_raw_events
 from app.schemas import (
+    CanonicalEventType,
+    CanonicalEvent,
     GoogleOAuthMockCallbackRequest,
     GoogleOAuthCallbackResponse,
     IngestionMockTriggerRequest,
     IngestionMockTriggerResponse,
+    IngestionSource,
     Layer2ManualCaptureRequest,
     Layer3EventsResponse,
+    Layer3ParseResponse,
+    CanonicalParseFailure,
+    Layer3PersistenceSummary,
+    PipelineRunStatusResponse,
     PipelineRunResponse,
     RawEventsByTraceResponse,
 )
@@ -46,6 +55,15 @@ def _get_canonical_event_store() -> CanonicalEventStore:
 
 def get_canonical_event_store() -> CanonicalEventStore:
     return _get_canonical_event_store()
+
+
+@lru_cache(maxsize=1)
+def _get_pipeline_store() -> PipelineStore:
+    return create_pipeline_store(settings)
+
+
+def get_pipeline_store() -> PipelineStore:
+    return _get_pipeline_store()
 
 
 async def _send_inngest_event(*, name: str, data: dict) -> str | None:
@@ -224,6 +242,7 @@ async def run_layer2_capture(
                 "user_id": request.source_events[0].user_id,
                 "parser_version": settings.parser_version,
                 "source_events": [event.model_dump(mode="json") for event in request.source_events],
+                "source": str(request.source_events[0].source),
             },
         )
     except Exception as exc:
@@ -253,6 +272,7 @@ async def replay_stage_canonicalization(
                 "tenant_id": events[0].tenant_id,
                 "user_id": events[0].user_id,
                 "parser_version": settings.parser_version,
+                "source": str(events[0].source),
             },
         )
     except Exception as exc:
@@ -265,32 +285,60 @@ async def replay_stage_canonicalization(
     )
 
 
-@router.post("/layer3/parse/{trace_id}", response_model=PipelineRunResponse)
-async def parse_layer3_by_trace(
+@router.post("/layer3/parse/{trace_id}", response_model=Layer3ParseResponse)
+def parse_layer3_by_trace(
     trace_id: str,
     raw_store: RawEventStore = Depends(get_raw_event_store),
-    dispatch_event: InngestDispatcher = Depends(get_inngest_dispatcher),
-) -> PipelineRunResponse:
-    events = raw_store.list_by_trace_id(trace_id)
-    if not events:
+    canonical_store: CanonicalEventStore = Depends(get_canonical_event_store),
+) -> Layer3ParseResponse:
+    raw_events = raw_store.list_by_trace_id(trace_id)
+    if not raw_events:
         raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
-    try:
-        event_id = await dispatch_event(
-            "pipeline/stage.canonicalization.replay.requested",
-            {
-                "trace_id": trace_id,
-                "tenant_id": events[0].tenant_id,
-                "user_id": events[0].user_id,
-                "parser_version": settings.parser_version,
-            },
+
+    parse_result = parse_raw_events(raw_events)
+    persist_result = canonical_store.persist_parsed_events(
+        parse_result.parsed_events,
+        settings.parser_version,
+        run_id=raw_events[0].run_id,
+    )
+
+    parsed_events = [
+        CanonicalEvent(
+            raw_event_id=item.raw_event_id,
+            run_id=raw_events[0].run_id,
+            tenant_id=item.tenant_id,
+            user_id=item.user_id,
+            trace_id=item.trace_id,
+            source=IngestionSource(str(item.source)),
+            source_event_id=item.source_event_id,
+            occurred_at=item.occurred_at,
+            event_type=CanonicalEventType(str(item.event_type)),
+            normalized=item.normalized,
+            parse_warnings=item.parse_warnings,
         )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Inngest dispatch failed: {exc}") from exc
-    return PipelineRunResponse(
-        run_id=None,
-        event_name="pipeline/stage.canonicalization.replay.requested",
-        event_id=event_id,
+        for item in parse_result.parsed_events
+    ]
+
+    return Layer3ParseResponse(
         trace_id=trace_id,
+        total_raw_events=len(raw_events),
+        parsed_count=len(parse_result.parsed_events),
+        failed_count=len(parse_result.failures),
+        parsed_events=parsed_events,
+        failures=[
+            CanonicalParseFailure(
+                raw_event_id=f.raw_event_id,
+                source_event_id=f.source_event_id,
+                reason=f.reason,
+            )
+            for f in parse_result.failures
+        ],
+        persistence=Layer3PersistenceSummary(
+            stored_count=persist_result.stored_count,
+            store=canonical_store.store_name,
+            parser_version=settings.parser_version,
+            parsed_at=persist_result.parsed_at,
+        ),
     )
 
 
@@ -304,4 +352,26 @@ def get_layer3_events_by_trace(
         trace_id=trace_id,
         total=len(events),
         events=events,
+    )
+
+
+@router.get("/pipeline/run/{trace_id}", response_model=PipelineRunStatusResponse)
+def get_pipeline_run_by_trace(
+    trace_id: str,
+    pipeline_store: PipelineStore = Depends(get_pipeline_store),
+) -> PipelineRunStatusResponse:
+    run = pipeline_store.get_run_by_trace_id(trace_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"No pipeline run found for trace_id={trace_id}")
+    return PipelineRunStatusResponse(
+        run_id=run.run_id,
+        trace_id=run.trace_id,
+        tenant_id=run.tenant_id,
+        user_id=run.user_id,
+        source=run.source,
+        trigger_type=run.trigger_type,
+        status=run.status,
+        requested_at=run.requested_at,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
     )

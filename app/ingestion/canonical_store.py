@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -41,6 +42,10 @@ class CanonicalEventStore(ABC):
         self,
         parsed_events: list[ParsedCanonicalEvent],
         parser_version: str,
+        *,
+        run_id: str | None = None,
+        schema_version: str = "v1",
+        parse_status: str = "parsed",
     ) -> CanonicalPersistResult:
         raise NotImplementedError
 
@@ -68,6 +73,7 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
                 CREATE TABLE IF NOT EXISTS canonical_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     raw_event_id INTEGER NOT NULL,
+                    run_id TEXT,
                     tenant_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     trace_id TEXT NOT NULL,
@@ -77,11 +83,27 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
                     event_type TEXT NOT NULL,
                     normalized_json TEXT NOT NULL,
                     parse_warnings_json TEXT NOT NULL,
+                    parse_status TEXT NOT NULL DEFAULT 'parsed',
+                    schema_version TEXT NOT NULL DEFAULT 'v1',
+                    canonical_hash TEXT,
                     parser_version TEXT NOT NULL,
                     parsed_at TEXT NOT NULL
                 )
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(canonical_events)").fetchall()}
+            if "run_id" not in columns:
+                conn.execute("ALTER TABLE canonical_events ADD COLUMN run_id TEXT")
+            if "parse_status" not in columns:
+                conn.execute(
+                    "ALTER TABLE canonical_events ADD COLUMN parse_status TEXT NOT NULL DEFAULT 'parsed'"
+                )
+            if "schema_version" not in columns:
+                conn.execute(
+                    "ALTER TABLE canonical_events ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'v1'"
+                )
+            if "canonical_hash" not in columns:
+                conn.execute("ALTER TABLE canonical_events ADD COLUMN canonical_hash TEXT")
             conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_events_dedup
@@ -97,6 +119,10 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
         self,
         parsed_events: list[ParsedCanonicalEvent],
         parser_version: str,
+        *,
+        run_id: str | None = None,
+        schema_version: str = "v1",
+        parse_status: str = "parsed",
     ) -> CanonicalPersistResult:
         if not parsed_events:
             parsed_at = datetime.now(UTC)
@@ -106,6 +132,7 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
         rows = [
             (
                 event.raw_event_id,
+                run_id,
                 event.tenant_id,
                 event.user_id,
                 event.trace_id,
@@ -115,6 +142,11 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
                 str(event.event_type),
                 json.dumps(event.normalized, ensure_ascii=True),
                 json.dumps(event.parse_warnings, ensure_ascii=True),
+                parse_status,
+                schema_version,
+                hashlib.sha256(
+                    json.dumps(event.normalized, sort_keys=True, ensure_ascii=True).encode("utf-8")
+                ).hexdigest(),
                 parser_version,
                 parsed_at.isoformat(),
             )
@@ -125,13 +157,18 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
                 conn.executemany(
                     """
                     INSERT INTO canonical_events (
-                        raw_event_id, tenant_id, user_id, trace_id, source, source_event_id,
-                        occurred_at, event_type, normalized_json, parse_warnings_json, parser_version, parsed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        raw_event_id, run_id, tenant_id, user_id, trace_id, source, source_event_id,
+                        occurred_at, event_type, normalized_json, parse_warnings_json,
+                        parse_status, schema_version, canonical_hash, parser_version, parsed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(raw_event_id, event_type, parser_version)
                     DO UPDATE SET
+                        run_id=excluded.run_id,
                         normalized_json=excluded.normalized_json,
                         parse_warnings_json=excluded.parse_warnings_json,
+                        parse_status=excluded.parse_status,
+                        schema_version=excluded.schema_version,
+                        canonical_hash=excluded.canonical_hash,
                         parsed_at=excluded.parsed_at
                     """,
                     rows,
@@ -145,7 +182,7 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute(
                     """
-                    SELECT raw_event_id, tenant_id, user_id, trace_id, source, source_event_id,
+                    SELECT raw_event_id, run_id, tenant_id, user_id, trace_id, source, source_event_id,
                            occurred_at, event_type, normalized_json, parse_warnings_json
                     FROM canonical_events
                     WHERE trace_id = ?
@@ -160,6 +197,7 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
             output.append(
                 CanonicalEvent(
                     raw_event_id=int(row["raw_event_id"]),
+                    run_id=str(row["run_id"]) if row["run_id"] is not None else None,
                     tenant_id=str(row["tenant_id"]),
                     user_id=str(row["user_id"]),
                     trace_id=str(row["trace_id"]),
@@ -196,6 +234,10 @@ class SupabaseCanonicalEventStore(CanonicalEventStore):
         self,
         parsed_events: list[ParsedCanonicalEvent],
         parser_version: str,
+        *,
+        run_id: str | None = None,
+        schema_version: str = "v1",
+        parse_status: str = "parsed",
     ) -> CanonicalPersistResult:
         if not parsed_events:
             parsed_at = datetime.now(UTC)
@@ -204,9 +246,13 @@ class SupabaseCanonicalEventStore(CanonicalEventStore):
         parsed_at = datetime.now(UTC)
         payload: list[dict[str, Any]] = []
         for event in parsed_events:
+            canonical_hash = hashlib.sha256(
+                json.dumps(event.normalized, sort_keys=True, ensure_ascii=True).encode("utf-8")
+            ).hexdigest()
             payload.append(
                 {
                     "raw_event_id": event.raw_event_id,
+                    "run_id": run_id,
                     "tenant_id": event.tenant_id,
                     "user_id": event.user_id,
                     "trace_id": event.trace_id,
@@ -216,6 +262,9 @@ class SupabaseCanonicalEventStore(CanonicalEventStore):
                     "event_type": str(event.event_type),
                     "normalized_json": event.normalized,
                     "parse_warnings_json": event.parse_warnings,
+                    "parse_status": parse_status,
+                    "schema_version": schema_version,
+                    "canonical_hash": canonical_hash,
                     "parser_version": parser_version,
                     "parsed_at": parsed_at.isoformat(),
                 }
@@ -254,6 +303,7 @@ class SupabaseCanonicalEventStore(CanonicalEventStore):
             output.append(
                 CanonicalEvent(
                     raw_event_id=int(row["raw_event_id"]),
+                    run_id=str(row["run_id"]) if row.get("run_id") else None,
                     tenant_id=str(row["tenant_id"]),
                     user_id=str(row["user_id"]),
                     trace_id=str(row["trace_id"]),
@@ -277,4 +327,3 @@ def create_canonical_event_store(settings: Settings) -> CanonicalEventStore:
             table=settings.supabase_canonical_events_table,
         )
     return SqliteCanonicalEventStore(db_path=settings.canonical_events_db_path)
-

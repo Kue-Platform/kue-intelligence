@@ -36,7 +36,14 @@ class RawEventStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def persist_source_events(self, events: list[SourceEvent]) -> RawCaptureResult:
+    def persist_source_events(
+        self,
+        events: list[SourceEvent],
+        *,
+        run_id: str | None = None,
+        headers_json: dict[str, Any] | None = None,
+        ingest_version: str = "v1",
+    ) -> RawCaptureResult:
         raise NotImplementedError
 
     @abstractmethod
@@ -62,17 +69,28 @@ class SqliteRawEventStore(RawEventStore):
                 """
                 CREATE TABLE IF NOT EXISTS raw_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
                     tenant_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     source TEXT NOT NULL,
                     source_event_id TEXT NOT NULL,
                     occurred_at TEXT NOT NULL,
                     trace_id TEXT NOT NULL,
+                    headers_json TEXT NOT NULL DEFAULT '{}',
+                    ingest_version TEXT NOT NULL DEFAULT 'v1',
                     payload_json TEXT NOT NULL,
                     captured_at TEXT NOT NULL
                 )
                 """
             )
+            conn.execute("PRAGMA table_info(raw_events)")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(raw_events)").fetchall()}
+            if "run_id" not in columns:
+                conn.execute("ALTER TABLE raw_events ADD COLUMN run_id TEXT")
+            if "headers_json" not in columns:
+                conn.execute("ALTER TABLE raw_events ADD COLUMN headers_json TEXT NOT NULL DEFAULT '{}'")
+            if "ingest_version" not in columns:
+                conn.execute("ALTER TABLE raw_events ADD COLUMN ingest_version TEXT NOT NULL DEFAULT 'v1'")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_raw_events_trace_id ON raw_events(trace_id)"
             )
@@ -82,7 +100,14 @@ class SqliteRawEventStore(RawEventStore):
             )
             conn.commit()
 
-    def persist_source_events(self, events: list[SourceEvent]) -> RawCaptureResult:
+    def persist_source_events(
+        self,
+        events: list[SourceEvent],
+        *,
+        run_id: str | None = None,
+        headers_json: dict[str, Any] | None = None,
+        ingest_version: str = "v1",
+    ) -> RawCaptureResult:
         if not events:
             captured_at = datetime.now(UTC)
             return RawCaptureResult(stored_count=0, captured_at=captured_at)
@@ -96,6 +121,9 @@ class SqliteRawEventStore(RawEventStore):
                 event.source_event_id,
                 event.occurred_at.isoformat(),
                 event.trace_id,
+                run_id,
+                json.dumps(headers_json or {}, ensure_ascii=True),
+                ingest_version,
                 json.dumps(event.payload, ensure_ascii=True),
                 captured_at.isoformat(),
             )
@@ -107,8 +135,8 @@ class SqliteRawEventStore(RawEventStore):
                     """
                     INSERT INTO raw_events (
                         tenant_id, user_id, source, source_event_id, occurred_at,
-                        trace_id, payload_json, captured_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        trace_id, run_id, headers_json, ingest_version, payload_json, captured_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     rows,
                 )
@@ -121,7 +149,7 @@ class SqliteRawEventStore(RawEventStore):
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute(
                     """
-                    SELECT id, tenant_id, user_id, source, source_event_id,
+                    SELECT id, run_id, tenant_id, user_id, source, source_event_id,
                            occurred_at, trace_id, payload_json, captured_at
                     FROM raw_events
                     WHERE trace_id = ?
@@ -136,6 +164,7 @@ class SqliteRawEventStore(RawEventStore):
             events.append(
                 RawCapturedEvent(
                     raw_event_id=int(row["id"]),
+                    run_id=str(row["run_id"]) if row["run_id"] is not None else None,
                     tenant_id=str(row["tenant_id"]),
                     user_id=str(row["user_id"]),
                     source=IngestionSource(str(row["source"])),
@@ -167,7 +196,14 @@ class SupabaseRawEventStore(RawEventStore):
     def _rest_url(self) -> str:
         return f"{self._supabase_url}/rest/v1/{self._table}"
 
-    def persist_source_events(self, events: list[SourceEvent]) -> RawCaptureResult:
+    def persist_source_events(
+        self,
+        events: list[SourceEvent],
+        *,
+        run_id: str | None = None,
+        headers_json: dict[str, Any] | None = None,
+        ingest_version: str = "v1",
+    ) -> RawCaptureResult:
         if not events:
             captured_at = datetime.now(UTC)
             return RawCaptureResult(stored_count=0, captured_at=captured_at)
@@ -183,6 +219,9 @@ class SupabaseRawEventStore(RawEventStore):
                     "source_event_id": event.source_event_id,
                     "occurred_at": event.occurred_at.isoformat(),
                     "trace_id": event.trace_id,
+                    "run_id": run_id,
+                    "headers_json": headers_json or {},
+                    "ingest_version": ingest_version,
                     "payload_json": event.payload,
                     "captured_at": captured_at.isoformat(),
                 }
@@ -224,6 +263,7 @@ class SupabaseRawEventStore(RawEventStore):
             events.append(
                 RawCapturedEvent(
                     raw_event_id=int(row.get("id", 0)),
+                    run_id=str(row["run_id"]) if row.get("run_id") else None,
                     tenant_id=str(row["tenant_id"]),
                     user_id=str(row["user_id"]),
                     source=IngestionSource(str(row["source"])),
@@ -246,4 +286,3 @@ def create_raw_event_store(settings: Settings) -> RawEventStore:
             table=settings.supabase_raw_events_table,
         )
     return SqliteRawEventStore(db_path=settings.raw_events_db_path)
-

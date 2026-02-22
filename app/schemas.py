@@ -55,6 +55,7 @@ class SourceEvent(BaseModel):
 
 class RawCapturedEvent(BaseModel):
     raw_event_id: int
+    run_id: str | None = None
     tenant_id: str
     user_id: str
     source: IngestionSource
@@ -113,6 +114,7 @@ class CanonicalEventType(StrEnum):
 
 class CanonicalEvent(BaseModel):
     raw_event_id: int
+    run_id: str | None = None
     tenant_id: str
     user_id: str
     trace_id: str
@@ -159,3 +161,16 @@ class PipelineRunResponse(BaseModel):
     event_id: str | None = None
     trace_id: str
     status: str = "accepted"
+
+
+class PipelineRunStatusResponse(BaseModel):
+    run_id: str
+    trace_id: str
+    tenant_id: str
+    user_id: str
+    source: str | None = None
+    trigger_type: str
+    status: str
+    requested_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
