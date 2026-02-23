@@ -21,6 +21,8 @@ from app.ingestion.parsers import parse_raw_events
 from app.ingestion.enrichment import clean_and_enrich_events
 from app.ingestion.entity_resolution import extract_entity_candidates, merge_entity_candidates
 from app.ingestion.entity_store import EntityStore, create_entity_store
+from app.ingestion.relationship_extraction import compute_relationship_strength, extract_interactions
+from app.ingestion.relationship_store import RelationshipStore, create_relationship_store
 from app.ingestion.validators import validate_parsed_events
 from app.schemas import (
     CanonicalEventType,
@@ -37,6 +39,7 @@ from app.schemas import (
     Layer4ValidationResponse,
     Layer5EnrichmentResponse,
     Layer6EntityResolutionResponse,
+    Layer7RelationshipResponse,
     CanonicalParseFailure,
     Layer3PersistenceSummary,
     PipelineRunStatusResponse,
@@ -81,6 +84,15 @@ def _get_entity_store() -> EntityStore:
 
 def get_entity_store() -> EntityStore:
     return _get_entity_store()
+
+
+@lru_cache(maxsize=1)
+def _get_relationship_store() -> RelationshipStore:
+    return create_relationship_store(settings)
+
+
+def get_relationship_store() -> RelationshipStore:
+    return _get_relationship_store()
 
 
 async def _send_inngest_event(*, name: str, data: dict) -> str | None:
@@ -518,6 +530,49 @@ def resolve_layer6_by_trace(
         updated_entities=persist_result.updated_entities,
         identities_upserted=persist_result.identities_upserted,
         store=entity_store.store_name,
+    )
+
+
+@router.post("/layer7/relationships/{trace_id}", response_model=Layer7RelationshipResponse)
+def relationship_layer7_by_trace(
+    trace_id: str,
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    relationship_store: RelationshipStore = Depends(get_relationship_store),
+) -> Layer7RelationshipResponse:
+    raw_events = raw_store.list_by_trace_id(trace_id)
+    if not raw_events:
+        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+
+    parse_result = parse_raw_events(raw_events)
+    validation_result = validate_parsed_events(
+        {
+            "parsed_events": [
+                {
+                    "raw_event_id": item.raw_event_id,
+                    "tenant_id": item.tenant_id,
+                    "user_id": item.user_id,
+                    "trace_id": item.trace_id,
+                    "source": str(item.source),
+                    "source_event_id": item.source_event_id,
+                    "occurred_at": item.occurred_at.isoformat(),
+                    "event_type": str(item.event_type),
+                    "normalized": item.normalized,
+                    "parse_warnings": item.parse_warnings,
+                }
+                for item in parse_result.parsed_events
+            ]
+        }
+    )
+    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    interactions = extract_interactions(enrichment_result.model_dump(mode="json"))
+    strengths = compute_relationship_strength(interactions.model_dump(mode="json"))
+    persist_result = relationship_store.persist(interactions.interactions, strengths.relationships)
+    return Layer7RelationshipResponse(
+        trace_id=trace_id,
+        interaction_count=persist_result.interaction_count,
+        relationship_count=persist_result.relationship_count,
+        relationships_upserted=persist_result.relationships_upserted,
+        store=relationship_store.store_name,
     )
 
 

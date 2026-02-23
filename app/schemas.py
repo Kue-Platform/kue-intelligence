@@ -187,6 +187,14 @@ class Layer6EntityResolutionResponse(BaseModel):
     store: str
 
 
+class Layer7RelationshipResponse(BaseModel):
+    trace_id: str
+    interaction_count: int
+    relationship_count: int
+    relationships_upserted: int
+    store: str
+
+
 class PipelineRunResponse(BaseModel):
     run_id: str | None = None
     event_name: str

@@ -13,6 +13,8 @@ from app.ingestion.canonical_store import create_canonical_event_store
 from app.ingestion.enrichment import clean_and_enrich_events
 from app.ingestion.entity_resolution import extract_entity_candidates, merge_entity_candidates
 from app.ingestion.entity_store import create_entity_store
+from app.ingestion.relationship_extraction import compute_relationship_strength, extract_interactions
+from app.ingestion.relationship_store import create_relationship_store
 from app.ingestion.google_connector import GoogleOAuthConnector, GoogleOAuthContext
 from app.ingestion.parsers import parse_raw_events
 from app.ingestion.pipeline_store import PipelineStore, create_pipeline_store
@@ -238,6 +240,30 @@ def _persist_entities(merged_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _persist_relationships(
+    extract_payload: dict[str, Any],
+    strength_payload: dict[str, Any],
+) -> dict[str, Any]:
+    from app.ingestion.relationship_extraction import InteractionCandidate, RelationshipAggregate
+
+    interactions = [
+        InteractionCandidate.model_validate(item)
+        for item in list(extract_payload.get("interactions", []))
+    ]
+    relationships = [
+        RelationshipAggregate.model_validate(item)
+        for item in list(strength_payload.get("relationships", []))
+    ]
+    store = create_relationship_store(settings)
+    result = store.persist(interactions, relationships)
+    return {
+        "interaction_count": result.interaction_count,
+        "relationship_count": result.relationship_count,
+        "relationships_upserted": result.relationships_upserted,
+        "store": store.store_name,
+    }
+
+
 def _resolve_source_hint(data: dict[str, Any], source_events_payload: list[dict[str, Any]]) -> IngestionSource | None:
     if source_events_payload:
         first_source = source_events_payload[0].get("source")
@@ -321,6 +347,15 @@ def _run_layer_internal(
             result = merge_entity_candidates(dict(payload["exact_match_result"])).model_dump(mode="json")
         elif op == "entity_persist":
             result = _persist_entities(dict(payload["merge_result"]))
+        elif op == "extract_interactions":
+            result = extract_interactions(dict(payload["enrichment_result"])).model_dump(mode="json")
+        elif op == "compute_relationship_strength":
+            result = compute_relationship_strength(dict(payload["extract_result"])).model_dump(mode="json")
+        elif op == "persist_relationships":
+            result = _persist_relationships(
+                dict(payload["extract_result"]),
+                dict(payload["strength_result"]),
+            )
         elif op == "persist_canonical":
             result = _persist_canonical(
                 run_id,
@@ -465,6 +500,43 @@ def _layer_entity_persist(run_id: str, merge_result: dict[str, Any]) -> dict[str
     )
 
 
+def _layer_extract_interactions(run_id: str, enrichment_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="relationship_extraction",
+        layer_key="extract_interactions",
+        records_in=int(enrichment_result.get("enriched_count", 0)),
+        op="extract_interactions",
+        payload={"enrichment_result": enrichment_result},
+    )
+
+
+def _layer_compute_relationship_strength(run_id: str, extract_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="relationship_extraction",
+        layer_key="compute_strength",
+        records_in=int(extract_result.get("interaction_count", 0)),
+        op="compute_relationship_strength",
+        payload={"extract_result": extract_result},
+    )
+
+
+def _layer_persist_relationships(
+    run_id: str,
+    extract_result: dict[str, Any],
+    strength_result: dict[str, Any],
+) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="relationship_extraction",
+        layer_key="persist_relationships",
+        records_in=int(strength_result.get("relationship_count", 0)),
+        op="persist_relationships",
+        payload={"extract_result": extract_result, "strength_result": strength_result},
+    )
+
+
 def _mark_run_succeeded(run_id: str, metadata: dict[str, Any]) -> None:
     store = _pipeline_store()
     store.mark_pipeline_status(run_id=run_id, status="succeeded", metadata=metadata)
@@ -559,6 +631,25 @@ async def _run_pipeline_core(
             run_id,
             entity_merge,
         )
+        interactions = await ctx.step.run(
+            "stage.relationship_extraction.layer.extract_interactions",
+            _layer_extract_interactions,
+            run_id,
+            enrichment_result,
+        )
+        strengths = await ctx.step.run(
+            "stage.relationship_extraction.layer.compute_strength",
+            _layer_compute_relationship_strength,
+            run_id,
+            interactions,
+        )
+        relationship_persist = await ctx.step.run(
+            "stage.relationship_extraction.layer.persist_relationships",
+            _layer_persist_relationships,
+            run_id,
+            interactions,
+            strengths,
+        )
         summary = {
             "trace_id": trace_id,
             "run_id": run_id,
@@ -582,6 +673,11 @@ async def _run_pipeline_core(
                 "candidate_count": entity_exact.get("candidate_count", 0),
                 "resolved_count": entity_merge.get("resolved_count", 0),
                 **entity_persist,
+            },
+            "relationship_extraction": {
+                "interaction_count": interactions.get("interaction_count", 0),
+                "relationship_count": strengths.get("relationship_count", 0),
+                **relationship_persist,
             },
         }
         await ctx.step.run("stage.orchestration.layer.complete_run", _mark_run_succeeded, run_id, summary)
@@ -721,6 +817,25 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             run_id,
             entity_merge,
         )
+        interactions = await ctx.step.run(
+            "stage.relationship_extraction.layer.extract_interactions",
+            _layer_extract_interactions,
+            run_id,
+            enrichment_result,
+        )
+        strengths = await ctx.step.run(
+            "stage.relationship_extraction.layer.compute_strength",
+            _layer_compute_relationship_strength,
+            run_id,
+            interactions,
+        )
+        relationship_persist = await ctx.step.run(
+            "stage.relationship_extraction.layer.persist_relationships",
+            _layer_persist_relationships,
+            run_id,
+            interactions,
+            strengths,
+        )
         summary = {
             "trace_id": trace_id,
             "run_id": run_id,
@@ -739,6 +854,11 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
                 "candidate_count": entity_exact.get("candidate_count", 0),
                 "resolved_count": entity_merge.get("resolved_count", 0),
                 **entity_persist,
+            },
+            "relationship_extraction": {
+                "interaction_count": interactions.get("interaction_count", 0),
+                "relationship_count": strengths.get("relationship_count", 0),
+                **relationship_persist,
             },
             **canonical_result,
         }
