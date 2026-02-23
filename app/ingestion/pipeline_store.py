@@ -220,9 +220,41 @@ class SqlitePipelineStore(PipelineStore):
         metadata: dict[str, Any] | None = None,
     ) -> str:
         now = _utc_now().isoformat()
-        run_id = str(uuid4())
         with self._lock:
             with sqlite3.connect(self._db_path) as conn:
+                existing = conn.execute(
+                    """
+                    SELECT run_id
+                    FROM pipeline_runs
+                    WHERE tenant_id = ? AND trace_id = ?
+                    LIMIT 1
+                    """,
+                    (tenant_id, trace_id),
+                ).fetchone()
+                if existing is not None:
+                    existing_run_id = str(existing[0])
+                    conn.execute(
+                        """
+                        UPDATE pipeline_runs
+                        SET user_id = ?, source = ?, trigger_type = ?, source_event_id = ?,
+                            status = 'running', started_at = ?, completed_at = NULL,
+                            error_json = NULL, metadata_json = ?
+                        WHERE run_id = ?
+                        """,
+                        (
+                            user_id,
+                            str(source) if source else None,
+                            trigger_type,
+                            source_event_id,
+                            now,
+                            json.dumps(metadata or {}, ensure_ascii=True),
+                            existing_run_id,
+                        ),
+                    )
+                    conn.commit()
+                    return existing_run_id
+
+                run_id = str(uuid4())
                 conn.execute(
                     """
                     INSERT INTO pipeline_runs (
@@ -245,7 +277,7 @@ class SqlitePipelineStore(PipelineStore):
                     ),
                 )
                 conn.commit()
-        return run_id
+                return run_id
 
     def mark_pipeline_status(
         self,
@@ -484,9 +516,53 @@ class SupabasePipelineStore(PipelineStore):
             timeout=20.0,
         )
         if response.status_code >= 400:
-            raise RuntimeError(
-                f"Supabase pipeline_runs insert failed ({response.status_code}): {response.text}"
+            if not self._is_duplicate_conflict(response):
+                raise RuntimeError(
+                    f"Supabase pipeline_runs insert failed ({response.status_code}): {response.text}"
+                )
+            existing_lookup = httpx.get(
+                self._url("pipeline_runs"),
+                headers=self._base_headers,
+                params={
+                    "tenant_id": f"eq.{tenant_id}",
+                    "trace_id": f"eq.{trace_id}",
+                    "select": "run_id",
+                    "limit": 1,
+                },
+                timeout=20.0,
             )
+            if existing_lookup.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase pipeline_runs lookup failed ({existing_lookup.status_code}): {existing_lookup.text}"
+                )
+            rows = existing_lookup.json()
+            if not rows:
+                raise RuntimeError(
+                    f"Supabase pipeline_runs conflict without existing run: {response.text}"
+                )
+            existing_run_id = str(rows[0]["run_id"])
+            reset_response = httpx.patch(
+                self._url("pipeline_runs"),
+                headers=self._base_headers,
+                params={"run_id": f"eq.{existing_run_id}"},
+                json={
+                    "user_id": user_id,
+                    "source": str(source) if source else None,
+                    "trigger_type": trigger_type,
+                    "source_event_id": source_event_id,
+                    "status": "running",
+                    "started_at": _utc_now().isoformat(),
+                    "completed_at": None,
+                    "error_json": None,
+                    "metadata_json": metadata or {},
+                },
+                timeout=20.0,
+            )
+            if reset_response.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase pipeline_runs reset failed ({reset_response.status_code}): {reset_response.text}"
+                )
+            return existing_run_id
         rows = response.json()
         if not rows:
             raise RuntimeError("Supabase pipeline_runs insert returned empty result")
