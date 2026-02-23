@@ -228,8 +228,14 @@ class SupabaseRawEventStore(RawEventStore):
             )
 
         headers = dict(self._base_headers)
-        headers["Prefer"] = "return=minimal"
-        response = httpx.post(self._rest_url(), headers=headers, json=payload, timeout=20.0)
+        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        response = httpx.post(
+            self._rest_url(),
+            headers=headers,
+            params={"on_conflict": "tenant_id,user_id,source,source_event_id"},
+            json=payload,
+            timeout=20.0,
+        )
         if response.status_code >= 400:
             raise RuntimeError(
                 f"Supabase raw event insert failed ({response.status_code}): {response.text}"

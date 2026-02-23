@@ -178,6 +178,12 @@ class SqlitePipelineStore(PipelineStore):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_stage_runs_dedup
+                ON pipeline_stage_runs(run_id, stage_key, layer_key, attempt)
+                """
+            )
             conn.commit()
 
     def ensure_tenant_user(self, tenant_id: str, user_id: str) -> None:
@@ -285,11 +291,33 @@ class SqlitePipelineStore(PipelineStore):
                     INSERT INTO pipeline_stage_runs (
                         run_id, stage_key, layer_key, status, attempt, started_at, records_in
                     ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id, stage_key, layer_key, attempt)
+                    DO UPDATE SET
+                        status=excluded.status,
+                        started_at=excluded.started_at,
+                        completed_at=NULL,
+                        duration_ms=NULL,
+                        records_in=excluded.records_in,
+                        error_json=NULL
                     """,
                     (run_id, stage_key, layer_key, "running", attempt, now, records_in),
                 )
+                stage_run_id = int(cursor.lastrowid)
+                if stage_run_id == 0:
+                    row = conn.execute(
+                        """
+                        SELECT id
+                        FROM pipeline_stage_runs
+                        WHERE run_id = ? AND stage_key = ? AND layer_key = ? AND attempt = ?
+                        LIMIT 1
+                        """,
+                        (run_id, stage_key, layer_key, attempt),
+                    ).fetchone()
+                    if row is None:
+                        raise RuntimeError("Failed to resolve stage_run_id after upsert")
+                    stage_run_id = int(row[0])
                 conn.commit()
-                return int(cursor.lastrowid)
+                return stage_run_id
 
     def finish_stage_run(
         self,
@@ -505,17 +533,62 @@ class SupabasePipelineStore(PipelineStore):
         if records_in is not None:
             payload["records_in"] = records_in
         headers = dict(self._base_headers)
-        headers["Prefer"] = "return=representation"
+        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
         response = httpx.post(
             self._url("pipeline_stage_runs"),
             headers=headers,
+            params={"on_conflict": "run_id,stage_key,layer_key,attempt"},
             json=[payload],
             timeout=20.0,
         )
         if response.status_code >= 400:
-            raise RuntimeError(
-                f"Supabase pipeline_stage_runs insert failed ({response.status_code}): {response.text}"
+            # Graceful fallback for older PostgREST behavior: recover existing row.
+            if response.status_code != 409:
+                raise RuntimeError(
+                    f"Supabase pipeline_stage_runs insert failed ({response.status_code}): {response.text}"
+                )
+            lookup = httpx.get(
+                self._url("pipeline_stage_runs"),
+                headers=self._base_headers,
+                params={
+                    "run_id": f"eq.{run_id}",
+                    "stage_key": f"eq.{stage_key}",
+                    "layer_key": f"eq.{layer_key}",
+                    "attempt": f"eq.{attempt}",
+                    "select": "id",
+                    "limit": 1,
+                },
+                timeout=20.0,
             )
+            if lookup.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase pipeline_stage_runs lookup failed ({lookup.status_code}): {lookup.text}"
+                )
+            rows = lookup.json()
+            if not rows:
+                raise RuntimeError(
+                    f"Supabase pipeline_stage_runs conflict without existing row: {response.text}"
+                )
+            existing_id = int(rows[0]["id"])
+            reset = httpx.patch(
+                self._url("pipeline_stage_runs"),
+                headers=self._base_headers,
+                params={"id": f"eq.{existing_id}"},
+                json={
+                    "status": "running",
+                    "started_at": payload["started_at"],
+                    "completed_at": None,
+                    "duration_ms": None,
+                    "records_in": records_in,
+                    "error_json": None,
+                },
+                timeout=20.0,
+            )
+            if reset.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase pipeline_stage_runs reset failed ({reset.status_code}): {reset.text}"
+                )
+            return existing_id
         rows = response.json()
         if not rows:
             raise RuntimeError("Supabase pipeline_stage_runs insert returned empty result")
