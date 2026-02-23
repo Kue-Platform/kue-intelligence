@@ -270,19 +270,77 @@ class SupabaseCanonicalEventStore(CanonicalEventStore):
                 }
             )
 
-        headers = dict(self._base_headers)
-        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
         response = httpx.post(
             self._rest_url(),
-            headers=headers,
-            params={"on_conflict": "raw_event_id,event_type,parser_version"},
+            headers=self._base_headers,
             json=payload,
             timeout=20.0,
         )
         if response.status_code >= 400:
-            raise RuntimeError(
-                f"Supabase canonical event insert failed ({response.status_code}): {response.text}"
-            )
+            body = (response.text or "").lower()
+            is_conflict = response.status_code == 409 or "23505" in body
+            if not is_conflict:
+                raise RuntimeError(
+                    f"Supabase canonical event insert failed ({response.status_code}): {response.text}"
+                )
+            # Fallback: upsert one row at a time via select-first
+            for row in payload:
+                dedup_params = {
+                    "raw_event_id": f"eq.{row['raw_event_id']}",
+                    "event_type": f"eq.{row['event_type']}",
+                    "parser_version": f"eq.{row['parser_version']}",
+                }
+                lookup = httpx.get(
+                    self._rest_url(),
+                    headers=self._base_headers,
+                    params={**dedup_params, "select": "id", "limit": 1},
+                    timeout=20.0,
+                )
+                if lookup.status_code < 400 and lookup.json():
+                    httpx.patch(
+                        self._rest_url(),
+                        headers=self._base_headers,
+                        params=dedup_params,
+                        json={
+                            "run_id": row["run_id"],
+                            "normalized_json": row["normalized_json"],
+                            "parse_warnings_json": row["parse_warnings_json"],
+                            "parse_status": row["parse_status"],
+                            "schema_version": row["schema_version"],
+                            "canonical_hash": row["canonical_hash"],
+                            "parsed_at": row["parsed_at"],
+                        },
+                        timeout=20.0,
+                    )
+                else:
+                    single_response = httpx.post(
+                        self._rest_url(),
+                        headers=self._base_headers,
+                        json=[row],
+                        timeout=20.0,
+                    )
+                    if single_response.status_code >= 400:
+                        single_body = (single_response.text or "").lower()
+                        if single_response.status_code != 409 and "23505" not in single_body:
+                            raise RuntimeError(
+                                f"Supabase canonical event row insert failed ({single_response.status_code}): {single_response.text}"
+                            )
+                        # Final race-condition fallback
+                        httpx.patch(
+                            self._rest_url(),
+                            headers=self._base_headers,
+                            params=dedup_params,
+                            json={
+                                "run_id": row["run_id"],
+                                "normalized_json": row["normalized_json"],
+                                "parse_warnings_json": row["parse_warnings_json"],
+                                "parse_status": row["parse_status"],
+                                "schema_version": row["schema_version"],
+                                "canonical_hash": row["canonical_hash"],
+                                "parsed_at": row["parsed_at"],
+                            },
+                            timeout=20.0,
+                        )
         return CanonicalPersistResult(stored_count=len(payload), parsed_at=parsed_at)
 
     def list_by_trace_id(self, trace_id: str) -> list[CanonicalEvent]:

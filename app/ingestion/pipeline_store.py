@@ -447,43 +447,69 @@ class SupabasePipelineStore(PipelineStore):
 
     def ensure_tenant_user(self, tenant_id: str, user_id: str) -> None:
         now = _utc_now().isoformat()
-        tenant_payload = {
-            "tenant_id": tenant_id,
-            "name": tenant_id,
-            "updated_at": now,
-        }
-        tenant_headers = dict(self._base_headers)
-        tenant_headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-        tenant_response = httpx.post(
-            self._url("tenants"),
-            headers=tenant_headers,
-            params={"on_conflict": "tenant_id"},
-            json=[tenant_payload],
-            timeout=20.0,
-        )
-        if tenant_response.status_code >= 400:
-            raise RuntimeError(
-                f"Supabase tenants upsert failed ({tenant_response.status_code}): {tenant_response.text}"
-            )
 
-        user_payload = {
-            "tenant_id": tenant_id,
-            "user_id": user_id,
-            "updated_at": now,
-        }
-        user_headers = dict(self._base_headers)
-        user_headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-        user_response = httpx.post(
-            self._url("tenant_users"),
-            headers=user_headers,
-            params={"on_conflict": "tenant_id,user_id"},
-            json=[user_payload],
+        # ── Upsert tenant ──
+        existing_tenant = httpx.get(
+            self._url("tenants"),
+            headers=self._base_headers,
+            params={"tenant_id": f"eq.{tenant_id}", "select": "tenant_id", "limit": 1},
             timeout=20.0,
         )
-        if user_response.status_code >= 400:
-            raise RuntimeError(
-                f"Supabase tenant_users upsert failed ({user_response.status_code}): {user_response.text}"
+        if existing_tenant.status_code < 400 and existing_tenant.json():
+            httpx.patch(
+                self._url("tenants"),
+                headers=self._base_headers,
+                params={"tenant_id": f"eq.{tenant_id}"},
+                json={"updated_at": now},
+                timeout=20.0,
             )
+        else:
+            tenant_payload = {"tenant_id": tenant_id, "name": tenant_id, "updated_at": now}
+            tenant_response = httpx.post(
+                self._url("tenants"),
+                headers=self._base_headers,
+                json=[tenant_payload],
+                timeout=20.0,
+            )
+            if tenant_response.status_code >= 400:
+                if not self._is_duplicate_conflict(tenant_response):
+                    raise RuntimeError(
+                        f"Supabase tenants upsert failed ({tenant_response.status_code}): {tenant_response.text}"
+                    )
+
+        # ── Upsert tenant_user ──
+        existing_user = httpx.get(
+            self._url("tenant_users"),
+            headers=self._base_headers,
+            params={
+                "tenant_id": f"eq.{tenant_id}",
+                "user_id": f"eq.{user_id}",
+                "select": "tenant_id",
+                "limit": 1,
+            },
+            timeout=20.0,
+        )
+        if existing_user.status_code < 400 and existing_user.json():
+            httpx.patch(
+                self._url("tenant_users"),
+                headers=self._base_headers,
+                params={"tenant_id": f"eq.{tenant_id}", "user_id": f"eq.{user_id}"},
+                json={"updated_at": now},
+                timeout=20.0,
+            )
+        else:
+            user_payload = {"tenant_id": tenant_id, "user_id": user_id, "updated_at": now}
+            user_response = httpx.post(
+                self._url("tenant_users"),
+                headers=self._base_headers,
+                json=[user_payload],
+                timeout=20.0,
+            )
+            if user_response.status_code >= 400:
+                if not self._is_duplicate_conflict(user_response):
+                    raise RuntimeError(
+                        f"Supabase tenant_users upsert failed ({user_response.status_code}): {user_response.text}"
+                    )
 
     def create_pipeline_run(
         self,

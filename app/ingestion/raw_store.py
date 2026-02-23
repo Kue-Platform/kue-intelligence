@@ -203,47 +203,62 @@ class SupabaseRawEventStore(RawEventStore):
         return "duplicate key value violates unique constraint" in body
 
     def _upsert_single_row(self, row_payload: dict[str, Any]) -> None:
-        headers = dict(self._base_headers)
-        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-        upsert_response = httpx.post(
+        update_body = {
+            "occurred_at": row_payload["occurred_at"],
+            "trace_id": row_payload["trace_id"],
+            "run_id": row_payload.get("run_id"),
+            "headers_json": row_payload.get("headers_json", {}),
+            "ingest_version": row_payload.get("ingest_version", "v1"),
+            "payload_json": row_payload["payload_json"],
+            "captured_at": row_payload["captured_at"],
+        }
+        dedup_params = {
+            "tenant_id": f"eq.{row_payload['tenant_id']}",
+            "user_id": f"eq.{row_payload['user_id']}",
+            "source": f"eq.{row_payload['source']}",
+            "source_event_id": f"eq.{row_payload['source_event_id']}",
+        }
+
+        # Check if row exists
+        lookup = httpx.get(
             self._rest_url(),
-            headers=headers,
-            params={"on_conflict": "tenant_id,user_id,source,source_event_id"},
+            headers=self._base_headers,
+            params={**dedup_params, "select": "id", "limit": 1},
+            timeout=20.0,
+        )
+        if lookup.status_code < 400 and lookup.json():
+            update_response = httpx.patch(
+                self._rest_url(),
+                headers=self._base_headers,
+                params=dedup_params,
+                json=update_body,
+                timeout=20.0,
+            )
+            if update_response.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase raw event row update failed ({update_response.status_code}): {update_response.text}"
+                )
+            return
+
+        # Insert new row
+        insert_response = httpx.post(
+            self._rest_url(),
+            headers=self._base_headers,
             json=[row_payload],
             timeout=20.0,
         )
-        if upsert_response.status_code < 400:
-            return
-
-        if not self._is_duplicate_conflict(upsert_response):
-            raise RuntimeError(
-                f"Supabase raw event row upsert failed ({upsert_response.status_code}): {upsert_response.text}"
-            )
-
-        # Final fallback for strict conflict behavior: update existing row by dedup key.
-        update_response = httpx.patch(
-            self._rest_url(),
-            headers=self._base_headers,
-            params={
-                "tenant_id": f"eq.{row_payload['tenant_id']}",
-                "user_id": f"eq.{row_payload['user_id']}",
-                "source": f"eq.{row_payload['source']}",
-                "source_event_id": f"eq.{row_payload['source_event_id']}",
-            },
-            json={
-                "occurred_at": row_payload["occurred_at"],
-                "trace_id": row_payload["trace_id"],
-                "run_id": row_payload.get("run_id"),
-                "headers_json": row_payload.get("headers_json", {}),
-                "ingest_version": row_payload.get("ingest_version", "v1"),
-                "payload_json": row_payload["payload_json"],
-                "captured_at": row_payload["captured_at"],
-            },
-            timeout=20.0,
-        )
-        if update_response.status_code >= 400:
-            raise RuntimeError(
-                f"Supabase raw event row update failed ({update_response.status_code}): {update_response.text}"
+        if insert_response.status_code >= 400:
+            if not self._is_duplicate_conflict(insert_response):
+                raise RuntimeError(
+                    f"Supabase raw event row upsert failed ({insert_response.status_code}): {insert_response.text}"
+                )
+            # Race-condition fallback: update existing row
+            httpx.patch(
+                self._rest_url(),
+                headers=self._base_headers,
+                params=dedup_params,
+                json=update_body,
+                timeout=20.0,
             )
 
     def persist_source_events(
@@ -277,12 +292,9 @@ class SupabaseRawEventStore(RawEventStore):
                 }
             )
 
-        headers = dict(self._base_headers)
-        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
         response = httpx.post(
             self._rest_url(),
-            headers=headers,
-            params={"on_conflict": "tenant_id,user_id,source,source_event_id"},
+            headers=self._base_headers,
             json=payload,
             timeout=20.0,
         )
@@ -291,7 +303,7 @@ class SupabaseRawEventStore(RawEventStore):
                 raise RuntimeError(
                     f"Supabase raw event insert failed ({response.status_code}): {response.text}"
                 )
-            # Graceful fallback: process one row at a time and update existing duplicates.
+            # Fallback: process one row at a time using select-first upsert.
             for row_payload in payload:
                 self._upsert_single_row(row_payload)
         return RawCaptureResult(stored_count=len(payload), captured_at=captured_at)

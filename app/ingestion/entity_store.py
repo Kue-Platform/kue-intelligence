@@ -334,30 +334,65 @@ class SupabaseEntityStore(EntityStore):
                     )
                 updated += 1
 
-            headers = dict(self._base_headers)
-            headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-            response = httpx.post(
+            identity_payload = {
+                "tenant_id": candidate.tenant_id,
+                "entity_id": entity_id,
+                "source": candidate.source,
+                "source_identity": candidate.source_event_id,
+                "email": candidate.primary_email,
+                "confidence": 1.0,
+                "is_primary": True,
+                "raw_event_id": candidate.raw_event_id,
+            }
+            dedup_params = {
+                "tenant_id": f"eq.{candidate.tenant_id}",
+                "source": f"eq.{candidate.source}",
+                "source_identity": f"eq.{candidate.source_event_id}",
+            }
+            lookup = httpx.get(
                 self._url("entity_identities"),
-                headers=headers,
-                params={"on_conflict": "tenant_id,source,source_identity"},
-                json=[
-                    {
-                        "tenant_id": candidate.tenant_id,
-                        "entity_id": entity_id,
-                        "source": candidate.source,
-                        "source_identity": candidate.source_event_id,
-                        "email": candidate.primary_email,
-                        "confidence": 1.0,
-                        "is_primary": True,
-                        "raw_event_id": candidate.raw_event_id,
-                    }
-                ],
+                headers=self._base_headers,
+                params={**dedup_params, "select": "id", "limit": 1},
                 timeout=20.0,
             )
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Supabase entity_identities upsert failed ({response.status_code}): {response.text}"
+            if lookup.status_code < 400 and lookup.json():
+                httpx.patch(
+                    self._url("entity_identities"),
+                    headers=self._base_headers,
+                    params=dedup_params,
+                    json={
+                        "entity_id": entity_id,
+                        "email": candidate.primary_email,
+                        "raw_event_id": candidate.raw_event_id,
+                    },
+                    timeout=20.0,
                 )
+            else:
+                response = httpx.post(
+                    self._url("entity_identities"),
+                    headers=self._base_headers,
+                    json=[identity_payload],
+                    timeout=20.0,
+                )
+                if response.status_code >= 400:
+                    body = (response.text or "").lower()
+                    is_conflict = response.status_code == 409 or "23505" in body
+                    if not is_conflict:
+                        raise RuntimeError(
+                            f"Supabase entity_identities upsert failed ({response.status_code}): {response.text}"
+                        )
+                    # Race-condition fallback
+                    httpx.patch(
+                        self._url("entity_identities"),
+                        headers=self._base_headers,
+                        params=dedup_params,
+                        json={
+                            "entity_id": entity_id,
+                            "email": candidate.primary_email,
+                            "raw_event_id": candidate.raw_event_id,
+                        },
+                        timeout=20.0,
+                    )
             identities += 1
 
         return EntityPersistResult(len(resolved_entities), created, updated, identities)

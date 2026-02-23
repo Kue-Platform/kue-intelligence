@@ -227,32 +227,71 @@ class SupabaseRelationshipStore(RelationshipStore):
             from_id, to_id = self._resolve_entity_ids(rel.tenant_id, rel.from_email, rel.to_email)
             if not from_id or not to_id:
                 continue
-            response = httpx.post(
+            rel_payload = {
+                "tenant_id": rel.tenant_id,
+                "from_entity_id": from_id,
+                "to_entity_id": to_id,
+                "relationship_type": rel.relationship_type,
+                "strength": rel.strength,
+                "first_interaction_at": rel.first_interaction_at,
+                "last_interaction_at": rel.last_interaction_at,
+                "interaction_count": rel.interaction_count,
+                "evidence_json": rel.evidence_json,
+            }
+            dedup_params = {
+                "tenant_id": f"eq.{rel.tenant_id}",
+                "from_entity_id": f"eq.{from_id}",
+                "to_entity_id": f"eq.{to_id}",
+                "relationship_type": f"eq.{rel.relationship_type}",
+            }
+            update_body = {
+                "strength": rel.strength,
+                "first_interaction_at": rel.first_interaction_at,
+                "last_interaction_at": rel.last_interaction_at,
+                "interaction_count": rel.interaction_count,
+                "evidence_json": rel.evidence_json,
+            }
+
+            lookup = httpx.get(
                 self._url("relationships"),
-                headers={
-                    **self._base_headers,
-                    "Prefer": "resolution=merge-duplicates,return=minimal",
-                },
-                params={"on_conflict": "tenant_id,from_entity_id,to_entity_id,relationship_type"},
-                json=[
-                    {
-                        "tenant_id": rel.tenant_id,
-                        "from_entity_id": from_id,
-                        "to_entity_id": to_id,
-                        "relationship_type": rel.relationship_type,
-                        "strength": rel.strength,
-                        "first_interaction_at": rel.first_interaction_at,
-                        "last_interaction_at": rel.last_interaction_at,
-                        "interaction_count": rel.interaction_count,
-                        "evidence_json": rel.evidence_json,
-                    }
-                ],
+                headers=self._base_headers,
+                params={**dedup_params, "select": "id", "limit": 1},
                 timeout=20.0,
             )
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Supabase relationships upsert failed ({response.status_code}): {response.text}"
+            if lookup.status_code < 400 and lookup.json():
+                patch_response = httpx.patch(
+                    self._url("relationships"),
+                    headers=self._base_headers,
+                    params=dedup_params,
+                    json=update_body,
+                    timeout=20.0,
                 )
+                if patch_response.status_code >= 400:
+                    raise RuntimeError(
+                        f"Supabase relationships update failed ({patch_response.status_code}): {patch_response.text}"
+                    )
+            else:
+                response = httpx.post(
+                    self._url("relationships"),
+                    headers=self._base_headers,
+                    json=[rel_payload],
+                    timeout=20.0,
+                )
+                if response.status_code >= 400:
+                    resp_body = (response.text or "").lower()
+                    is_conflict = response.status_code == 409 or "23505" in resp_body
+                    if not is_conflict:
+                        raise RuntimeError(
+                            f"Supabase relationships upsert failed ({response.status_code}): {response.text}"
+                        )
+                    # Race-condition fallback
+                    httpx.patch(
+                        self._url("relationships"),
+                        headers=self._base_headers,
+                        params=dedup_params,
+                        json=update_body,
+                        timeout=20.0,
+                    )
             upserted += 1
 
         return RelationshipPersistResult(
