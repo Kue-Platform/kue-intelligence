@@ -18,6 +18,10 @@ from app.ingestion.raw_store import RawEventStore
 from app.ingestion.raw_store import create_raw_event_store
 from app.inngest.runtime import inngest_client
 from app.ingestion.parsers import parse_raw_events
+from app.ingestion.enrichment import clean_and_enrich_events
+from app.ingestion.entity_resolution import extract_entity_candidates, merge_entity_candidates
+from app.ingestion.entity_store import EntityStore, create_entity_store
+from app.ingestion.validators import validate_parsed_events
 from app.schemas import (
     CanonicalEventType,
     CanonicalEvent,
@@ -29,6 +33,10 @@ from app.schemas import (
     Layer2ManualCaptureRequest,
     Layer3EventsResponse,
     Layer3ParseResponse,
+    Layer4ValidationFailure,
+    Layer4ValidationResponse,
+    Layer5EnrichmentResponse,
+    Layer6EntityResolutionResponse,
     CanonicalParseFailure,
     Layer3PersistenceSummary,
     PipelineRunStatusResponse,
@@ -64,6 +72,15 @@ def _get_pipeline_store() -> PipelineStore:
 
 def get_pipeline_store() -> PipelineStore:
     return _get_pipeline_store()
+
+
+@lru_cache(maxsize=1)
+def _get_entity_store() -> EntityStore:
+    return create_entity_store(settings)
+
+
+def get_entity_store() -> EntityStore:
+    return _get_entity_store()
 
 
 async def _send_inngest_event(*, name: str, data: dict) -> str | None:
@@ -352,6 +369,155 @@ def get_layer3_events_by_trace(
         trace_id=trace_id,
         total=len(events),
         events=events,
+    )
+
+
+@router.post("/layer4/validate/{trace_id}", response_model=Layer4ValidationResponse)
+def validate_layer4_by_trace(
+    trace_id: str,
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+) -> Layer4ValidationResponse:
+    raw_events = raw_store.list_by_trace_id(trace_id)
+    if not raw_events:
+        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+
+    parse_result = parse_raw_events(raw_events)
+    validation_result = validate_parsed_events(
+        {
+            "parsed_events": [
+                {
+                    "raw_event_id": item.raw_event_id,
+                    "tenant_id": item.tenant_id,
+                    "user_id": item.user_id,
+                    "trace_id": item.trace_id,
+                    "source": str(item.source),
+                    "source_event_id": item.source_event_id,
+                    "occurred_at": item.occurred_at.isoformat(),
+                    "event_type": str(item.event_type),
+                    "normalized": item.normalized,
+                    "parse_warnings": item.parse_warnings,
+                }
+                for item in parse_result.parsed_events
+            ]
+        }
+    )
+    return Layer4ValidationResponse(
+        trace_id=trace_id,
+        total_parsed_events=len(parse_result.parsed_events),
+        valid_count=validation_result.valid_count,
+        invalid_count=validation_result.invalid_count,
+        invalid_events=[
+            Layer4ValidationFailure(
+                raw_event_id=item.raw_event_id,
+                source_event_id=item.source_event_id,
+                event_type=item.event_type,
+                reason=item.reason,
+            )
+            for item in validation_result.invalid_events
+        ],
+    )
+
+
+@router.post("/layer5/enrich/{trace_id}", response_model=Layer5EnrichmentResponse)
+def enrich_layer5_by_trace(
+    trace_id: str,
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+) -> Layer5EnrichmentResponse:
+    raw_events = raw_store.list_by_trace_id(trace_id)
+    if not raw_events:
+        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+
+    parse_result = parse_raw_events(raw_events)
+    validation_result = validate_parsed_events(
+        {
+            "parsed_events": [
+                {
+                    "raw_event_id": item.raw_event_id,
+                    "tenant_id": item.tenant_id,
+                    "user_id": item.user_id,
+                    "trace_id": item.trace_id,
+                    "source": str(item.source),
+                    "source_event_id": item.source_event_id,
+                    "occurred_at": item.occurred_at.isoformat(),
+                    "event_type": str(item.event_type),
+                    "normalized": item.normalized,
+                    "parse_warnings": item.parse_warnings,
+                }
+                for item in parse_result.parsed_events
+            ]
+        }
+    )
+    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+
+    sample: list[CanonicalEvent] = []
+    for item in enrichment_result.parsed_events[:5]:
+        sample.append(
+            CanonicalEvent(
+                raw_event_id=int(item["raw_event_id"]),
+                run_id=raw_events[0].run_id,
+                tenant_id=str(item["tenant_id"]),
+                user_id=str(item["user_id"]),
+                trace_id=str(item["trace_id"]),
+                source=IngestionSource(str(item["source"])),
+                source_event_id=str(item["source_event_id"]),
+                occurred_at=item["occurred_at"],
+                event_type=CanonicalEventType(str(item["event_type"])),
+                normalized=dict(item["normalized"]),
+                parse_warnings=list(item.get("parse_warnings", [])),
+            )
+        )
+
+    return Layer5EnrichmentResponse(
+        trace_id=trace_id,
+        valid_count=validation_result.valid_count,
+        enriched_count=enrichment_result.enriched_count,
+        sample=sample,
+    )
+
+
+@router.post("/layer6/resolve/{trace_id}", response_model=Layer6EntityResolutionResponse)
+def resolve_layer6_by_trace(
+    trace_id: str,
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    entity_store: EntityStore = Depends(get_entity_store),
+) -> Layer6EntityResolutionResponse:
+    raw_events = raw_store.list_by_trace_id(trace_id)
+    if not raw_events:
+        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+
+    parse_result = parse_raw_events(raw_events)
+    validation_result = validate_parsed_events(
+        {
+            "parsed_events": [
+                {
+                    "raw_event_id": item.raw_event_id,
+                    "tenant_id": item.tenant_id,
+                    "user_id": item.user_id,
+                    "trace_id": item.trace_id,
+                    "source": str(item.source),
+                    "source_event_id": item.source_event_id,
+                    "occurred_at": item.occurred_at.isoformat(),
+                    "event_type": str(item.event_type),
+                    "normalized": item.normalized,
+                    "parse_warnings": item.parse_warnings,
+                }
+                for item in parse_result.parsed_events
+            ]
+        }
+    )
+    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    exact_match = extract_entity_candidates(enrichment_result.model_dump(mode="json"))
+    merge_result = merge_entity_candidates(exact_match.model_dump(mode="json"))
+    persist_result = entity_store.upsert_entities(merge_result.resolved_entities)
+
+    return Layer6EntityResolutionResponse(
+        trace_id=trace_id,
+        candidate_count=exact_match.candidate_count,
+        resolved_count=merge_result.resolved_count,
+        created_entities=persist_result.created_entities,
+        updated_entities=persist_result.updated_entities,
+        identities_upserted=persist_result.identities_upserted,
+        store=entity_store.store_name,
     )
 
 

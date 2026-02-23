@@ -155,6 +155,38 @@ class Layer3EventsResponse(BaseModel):
     events: list[CanonicalEvent]
 
 
+class Layer4ValidationFailure(BaseModel):
+    raw_event_id: int
+    source_event_id: str
+    event_type: str
+    reason: str
+
+
+class Layer4ValidationResponse(BaseModel):
+    trace_id: str
+    total_parsed_events: int
+    valid_count: int
+    invalid_count: int
+    invalid_events: list[Layer4ValidationFailure]
+
+
+class Layer5EnrichmentResponse(BaseModel):
+    trace_id: str
+    valid_count: int
+    enriched_count: int
+    sample: list[CanonicalEvent] = []
+
+
+class Layer6EntityResolutionResponse(BaseModel):
+    trace_id: str
+    candidate_count: int
+    resolved_count: int
+    created_entities: int
+    updated_entities: int
+    identities_upserted: int
+    store: str
+
+
 class PipelineRunResponse(BaseModel):
     run_id: str | None = None
     event_name: str

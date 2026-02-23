@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     inngest_signing_key: str = ""
     inngest_base_url: str = "https://inn.gs"
     inngest_source_app: str = "kue-intelligence"
+    inngest_max_retries: int = 5
+    alert_webhook_url: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

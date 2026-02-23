@@ -39,9 +39,13 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - `POST /v1/ingestion/google/oauth/callback/mock`: emit `kue/user.mock_connected` event.
 - `GET /v1/ingestion/raw-events/{trace_id}`: fetch Layer 2 captured raw events by trace id.
 - `POST /v1/ingestion/layer2/capture`: run stage pipeline from explicit source events.
-- `POST /v1/ingestion/layer3/parse/{trace_id}`: dispatch canonicalization replay in Inngest.
+- `POST /v1/ingestion/layer3/parse/{trace_id}`: manually run Layer 3 parse+persist for a trace id.
+- `POST /v1/ingestion/layer4/validate/{trace_id}`: manually run Layer 4 schema validation for parsed outputs.
+- `POST /v1/ingestion/layer5/enrich/{trace_id}`: manually run Layer 5 cleaning+enrichment on valid parsed events.
+- `POST /v1/ingestion/layer6/resolve/{trace_id}`: manually run Layer 6 dedup/entity resolution and persist entities.
 - `POST /v1/ingestion/stage/canonicalization/replay/{trace_id}`: replay canonicalization stage.
 - `GET /v1/ingestion/layer3/events/{trace_id}`: fetch persisted Layer 3 canonical events by trace id.
+- `GET /v1/ingestion/pipeline/run/{trace_id}`: fetch latest pipeline run status for a trace id.
 
 ### Layer 1 Test Endpoint Example
 
@@ -70,15 +74,19 @@ Callbacks emit Inngest events and Inngest functions execute stage orchestration:
 Inngest function then performs:
 - intake fetch from Google APIs (or mock payload adaptation)
 - `stage.raw_capture` (validate + persist raw events)
-- `stage.canonicalization` (fetch raw + parse + persist canonical)
-
-Each stage emits Inngest events:
-- `pipeline.run.started|completed|failed`
-- `stage.raw_capture.started|completed`
-- `stage.canonicalization.started|completed`
-- `*.layer.started|completed` for layer-level visibility
+- `stage.canonicalization` (fetch raw + parse)
+- `stage.validation` (schema enforcement, valid vs invalid split)
+- `stage.cleaning_enrichment` (normalize and enrich valid canonical payloads)
+- `stage.canonicalization` (persist only valid canonical records)
+- `stage.entity_resolution` (exact match, merge, and persist entities)
 
 Inngest functions are served from this API app via `inngest.fast_api.serve(...)`.
+
+### Retry And Alerts
+
+- All ingestion Inngest functions are configured with max retries via `INNGEST_MAX_RETRIES` (default `5`).
+- If retries are exhausted and the function still fails, an `on_failure` handler runs.
+- Configure `ALERT_WEBHOOK_URL` to receive JSON alerts for terminal failures.
 
 ### Google OAuth Callback Mock Example
 

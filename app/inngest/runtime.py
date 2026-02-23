@@ -6,13 +6,18 @@ from typing import Any
 from urllib.parse import urlparse
 
 import inngest
+import httpx
 
 from app.core.config import settings
 from app.ingestion.canonical_store import create_canonical_event_store
+from app.ingestion.enrichment import clean_and_enrich_events
+from app.ingestion.entity_resolution import extract_entity_candidates, merge_entity_candidates
+from app.ingestion.entity_store import create_entity_store
 from app.ingestion.google_connector import GoogleOAuthConnector, GoogleOAuthContext
 from app.ingestion.parsers import parse_raw_events
 from app.ingestion.pipeline_store import PipelineStore, create_pipeline_store
 from app.ingestion.raw_store import create_raw_event_store
+from app.ingestion.validators import validate_parsed_events
 from app.schemas import GoogleMockSourceType, IngestionSource, SourceEvent
 
 
@@ -35,6 +40,35 @@ inngest_client = inngest.Inngest(
 @lru_cache(maxsize=1)
 def _pipeline_store() -> PipelineStore:
     return create_pipeline_store(settings)
+
+
+async def _alert_on_failure(ctx: inngest.Context) -> None:
+    data = dict(ctx.event.data or {})
+    function_id = data.get("function_id")
+    run_id = data.get("run_id")
+    attempt = data.get("attempt")
+    error = data.get("error")
+
+    alert_payload = {
+        "type": "pipeline_function_failed",
+        "service": settings.app_name,
+        "function_id": function_id,
+        "run_id": run_id,
+        "attempt": attempt,
+        "max_retries": settings.inngest_max_retries,
+        "error": error,
+        "event": data,
+    }
+
+    if settings.alert_webhook_url:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(settings.alert_webhook_url, json=alert_payload)
+            response.raise_for_status()
+    else:
+        logging.getLogger("uvicorn").error(
+            "Pipeline failure after retries exhausted: %s",
+            alert_payload,
+        )
 
 
 def _validate_source_events(events_payload: list[dict[str, Any]]) -> dict[str, Any]:
@@ -186,6 +220,24 @@ def _persist_canonical(run_id: str, parsed_payload: dict[str, Any], parser_versi
     }
 
 
+def _persist_entities(merged_payload: dict[str, Any]) -> dict[str, Any]:
+    from app.ingestion.entity_resolution import EntityCandidate
+
+    resolved_entities = [
+        EntityCandidate.model_validate(item)
+        for item in list(merged_payload.get("resolved_entities", []))
+    ]
+    store = create_entity_store(settings)
+    persist_result = store.upsert_entities(resolved_entities)
+    return {
+        "resolved_count": persist_result.resolved_count,
+        "created_entities": persist_result.created_entities,
+        "updated_entities": persist_result.updated_entities,
+        "identities_upserted": persist_result.identities_upserted,
+        "store": store.store_name,
+    }
+
+
 def _resolve_source_hint(data: dict[str, Any], source_events_payload: list[dict[str, Any]]) -> IngestionSource | None:
     if source_events_payload:
         first_source = source_events_payload[0].get("source")
@@ -259,6 +311,16 @@ def _run_layer_internal(
             result = _fetch_raw_events(str(payload["trace_id"]))
         elif op == "parse_raw_events":
             result = _parse_raw_events(list(payload["raw_events"]))
+        elif op == "validate_canonical":
+            result = validate_parsed_events(dict(payload["parse_result"])).model_dump(mode="json")
+        elif op == "clean_and_enrich":
+            result = clean_and_enrich_events(dict(payload["validation_result"])).model_dump(mode="json")
+        elif op == "entity_exact_match":
+            result = extract_entity_candidates(dict(payload["enrichment_result"])).model_dump(mode="json")
+        elif op == "entity_merge":
+            result = merge_entity_candidates(dict(payload["exact_match_result"])).model_dump(mode="json")
+        elif op == "entity_persist":
+            result = _persist_entities(dict(payload["merge_result"]))
         elif op == "persist_canonical":
             result = _persist_canonical(
                 run_id,
@@ -335,13 +397,71 @@ def _layer_persist_canonical(
     parse_result: dict[str, Any],
     parser_version: str,
 ) -> dict[str, Any]:
+    parsed_count = int(parse_result.get("parsed_count", 0))
+    if parsed_count == 0:
+        parsed_count = len(list(parse_result.get("parsed_events", [])))
     return _run_layer_internal(
         run_id=run_id,
         stage_key="canonicalization",
         layer_key="persist",
-        records_in=int(parse_result.get("parsed_count", 0)),
+        records_in=parsed_count,
         op="persist_canonical",
         payload={"parse_result": parse_result, "parser_version": parser_version},
+    )
+
+
+def _layer_validate_canonical(run_id: str, parse_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="validation",
+        layer_key="schema_enforcement",
+        records_in=int(parse_result.get("parsed_count", 0)),
+        op="validate_canonical",
+        payload={"parse_result": parse_result},
+    )
+
+
+def _layer_clean_and_enrich(run_id: str, validation_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="cleaning_enrichment",
+        layer_key="normalize_and_enrich",
+        records_in=int(validation_result.get("valid_count", 0)),
+        op="clean_and_enrich",
+        payload={"validation_result": validation_result},
+    )
+
+
+def _layer_entity_exact_match(run_id: str, enrichment_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="entity_resolution",
+        layer_key="exact_match",
+        records_in=int(enrichment_result.get("enriched_count", 0)),
+        op="entity_exact_match",
+        payload={"enrichment_result": enrichment_result},
+    )
+
+
+def _layer_entity_merge(run_id: str, exact_match_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="entity_resolution",
+        layer_key="merge_entities",
+        records_in=int(exact_match_result.get("candidate_count", 0)),
+        op="entity_merge",
+        payload={"exact_match_result": exact_match_result},
+    )
+
+
+def _layer_entity_persist(run_id: str, merge_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="entity_resolution",
+        layer_key="persist_entities",
+        records_in=int(merge_result.get("resolved_count", 0)),
+        op="entity_persist",
+        payload={"merge_result": merge_result},
     )
 
 
@@ -402,12 +522,42 @@ async def _run_pipeline_core(
             run_id,
             list(raw_fetch.get("events", [])),
         )
+        validation_result = await ctx.step.run(
+            "stage.validation.layer.schema_enforcement",
+            _layer_validate_canonical,
+            run_id,
+            parse_result,
+        )
+        enrichment_result = await ctx.step.run(
+            "stage.cleaning_enrichment.layer.normalize_and_enrich",
+            _layer_clean_and_enrich,
+            run_id,
+            validation_result,
+        )
         canonical_result = await ctx.step.run(
             "stage.canonicalization.layer.persist",
             _layer_persist_canonical,
             run_id,
-            parse_result,
+            enrichment_result,
             parser_version,
+        )
+        entity_exact = await ctx.step.run(
+            "stage.entity_resolution.layer.exact_match",
+            _layer_entity_exact_match,
+            run_id,
+            enrichment_result,
+        )
+        entity_merge = await ctx.step.run(
+            "stage.entity_resolution.layer.merge_entities",
+            _layer_entity_merge,
+            run_id,
+            entity_exact,
+        )
+        entity_persist = await ctx.step.run(
+            "stage.entity_resolution.layer.persist_entities",
+            _layer_entity_persist,
+            run_id,
+            entity_merge,
         )
         summary = {
             "trace_id": trace_id,
@@ -420,6 +570,19 @@ async def _run_pipeline_core(
                 "failed_count": parse_result.get("failed_count", 0),
                 **canonical_result,
             },
+            "validation": {
+                "valid_count": validation_result.get("valid_count", 0),
+                "invalid_count": validation_result.get("invalid_count", 0),
+                "invalid_events": validation_result.get("invalid_events", []),
+            },
+            "cleaning_enrichment": {
+                "enriched_count": enrichment_result.get("enriched_count", 0),
+            },
+            "entity_resolution": {
+                "candidate_count": entity_exact.get("candidate_count", 0),
+                "resolved_count": entity_merge.get("resolved_count", 0),
+                **entity_persist,
+            },
         }
         await ctx.step.run("stage.orchestration.layer.complete_run", _mark_run_succeeded, run_id, summary)
         return summary
@@ -431,6 +594,8 @@ async def _run_pipeline_core(
 @inngest_client.create_function(
     fn_id="ingestion-pipeline-run",
     trigger=inngest.TriggerEvent(event="pipeline/run.requested"),
+    retries=settings.inngest_max_retries,
+    on_failure=_alert_on_failure,
 )
 async def ingestion_pipeline_run(ctx: inngest.Context) -> dict[str, Any]:
     data = ctx.event.data or {}
@@ -448,6 +613,8 @@ async def ingestion_pipeline_run(ctx: inngest.Context) -> dict[str, Any]:
 @inngest_client.create_function(
     fn_id="ingestion-user-connected",
     trigger=inngest.TriggerEvent(event="kue/user.connected"),
+    retries=settings.inngest_max_retries,
+    on_failure=_alert_on_failure,
 )
 async def ingestion_user_connected(ctx: inngest.Context) -> dict[str, Any]:
     data = ctx.event.data or {}
@@ -467,6 +634,8 @@ async def ingestion_user_connected(ctx: inngest.Context) -> dict[str, Any]:
 @inngest_client.create_function(
     fn_id="ingestion-user-mock-connected",
     trigger=inngest.TriggerEvent(event="kue/user.mock_connected"),
+    retries=settings.inngest_max_retries,
+    on_failure=_alert_on_failure,
 )
 async def ingestion_user_mock_connected(ctx: inngest.Context) -> dict[str, Any]:
     data = ctx.event.data or {}
@@ -486,6 +655,8 @@ async def ingestion_user_mock_connected(ctx: inngest.Context) -> dict[str, Any]:
 @inngest_client.create_function(
     fn_id="ingestion-stage-canonicalization-replay",
     trigger=inngest.TriggerEvent(event="pipeline/stage.canonicalization.replay.requested"),
+    retries=settings.inngest_max_retries,
+    on_failure=_alert_on_failure,
 )
 async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
     data = ctx.event.data or {}
@@ -513,12 +684,42 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             run_id,
             list(raw_fetch.get("events", [])),
         )
+        validation_result = await ctx.step.run(
+            "stage.validation.layer.schema_enforcement",
+            _layer_validate_canonical,
+            run_id,
+            parse_result,
+        )
+        enrichment_result = await ctx.step.run(
+            "stage.cleaning_enrichment.layer.normalize_and_enrich",
+            _layer_clean_and_enrich,
+            run_id,
+            validation_result,
+        )
         canonical_result = await ctx.step.run(
             "stage.canonicalization.layer.persist",
             _layer_persist_canonical,
             run_id,
-            parse_result,
+            enrichment_result,
             parser_version,
+        )
+        entity_exact = await ctx.step.run(
+            "stage.entity_resolution.layer.exact_match",
+            _layer_entity_exact_match,
+            run_id,
+            enrichment_result,
+        )
+        entity_merge = await ctx.step.run(
+            "stage.entity_resolution.layer.merge_entities",
+            _layer_entity_merge,
+            run_id,
+            entity_exact,
+        )
+        entity_persist = await ctx.step.run(
+            "stage.entity_resolution.layer.persist_entities",
+            _layer_entity_persist,
+            run_id,
+            entity_merge,
         )
         summary = {
             "trace_id": trace_id,
@@ -526,6 +727,19 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             "raw_count": raw_fetch.get("count", 0),
             "parsed_count": parse_result.get("parsed_count", 0),
             "failed_count": parse_result.get("failed_count", 0),
+            "validation": {
+                "valid_count": validation_result.get("valid_count", 0),
+                "invalid_count": validation_result.get("invalid_count", 0),
+                "invalid_events": validation_result.get("invalid_events", []),
+            },
+            "cleaning_enrichment": {
+                "enriched_count": enrichment_result.get("enriched_count", 0),
+            },
+            "entity_resolution": {
+                "candidate_count": entity_exact.get("candidate_count", 0),
+                "resolved_count": entity_merge.get("resolved_count", 0),
+                **entity_persist,
+            },
             **canonical_result,
         }
         await ctx.step.run("stage.orchestration.layer.complete_run", _mark_run_succeeded, run_id, summary)
