@@ -604,53 +604,91 @@ class SupabasePipelineStore(PipelineStore):
         attempt: int = 1,
         records_in: int | None = None,
     ) -> int:
+        now = _utc_now().isoformat()
+        reset_body: dict[str, Any] = {
+            "status": "running",
+            "started_at": now,
+            "completed_at": None,
+            "duration_ms": None,
+            "records_in": records_in,
+            "records_out": None,
+            "error_json": None,
+        }
+
+        # ── 1. Check if this stage run already exists ──
+        lookup = httpx.get(
+            self._url("pipeline_stage_runs"),
+            headers=self._base_headers,
+            params={
+                "run_id": f"eq.{run_id}",
+                "stage_key": f"eq.{stage_key}",
+                "layer_key": f"eq.{layer_key}",
+                "attempt": f"eq.{attempt}",
+                "select": "id",
+                "limit": 1,
+            },
+            timeout=20.0,
+        )
+        if lookup.status_code < 400:
+            existing_rows = lookup.json()
+            if existing_rows:
+                existing_id = int(existing_rows[0]["id"])
+                reset = httpx.patch(
+                    self._url("pipeline_stage_runs"),
+                    headers=self._base_headers,
+                    params={"id": f"eq.{existing_id}"},
+                    json=reset_body,
+                    timeout=20.0,
+                )
+                if reset.status_code >= 400:
+                    raise RuntimeError(
+                        f"Supabase pipeline_stage_runs reset failed ({reset.status_code}): {reset.text}"
+                    )
+                return existing_id
+
+        # ── 2. Row does not exist yet — insert ──
         payload: dict[str, Any] = {
             "run_id": run_id,
             "stage_key": stage_key,
             "layer_key": layer_key,
             "status": "running",
             "attempt": attempt,
-            "started_at": _utc_now().isoformat(),
+            "started_at": now,
         }
         if records_in is not None:
             payload["records_in"] = records_in
         headers = dict(self._base_headers)
-        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+        headers["Prefer"] = "return=representation"
         response = httpx.post(
             self._url("pipeline_stage_runs"),
             headers=headers,
-            params={"on_conflict": "run_id,stage_key,layer_key,attempt"},
             json=[payload],
             timeout=20.0,
         )
         if response.status_code >= 400:
-            # Graceful fallback for strict conflict behavior: recover existing row.
+            # ── 3. Race-condition fallback: another worker inserted first ──
             if not self._is_duplicate_conflict(response):
                 raise RuntimeError(
                     f"Supabase pipeline_stage_runs insert failed ({response.status_code}): {response.text}"
                 )
-            rows: list[dict[str, Any]] = []
-            for _ in range(3):
-                lookup = httpx.get(
-                    self._url("pipeline_stage_runs"),
-                    headers=self._base_headers,
-                    params={
-                        "run_id": f"eq.{run_id}",
-                        "stage_key": f"eq.{stage_key}",
-                        "layer_key": f"eq.{layer_key}",
-                        "attempt": f"eq.{attempt}",
-                        "select": "id",
-                        "limit": 1,
-                    },
-                    timeout=20.0,
+            fallback_lookup = httpx.get(
+                self._url("pipeline_stage_runs"),
+                headers=self._base_headers,
+                params={
+                    "run_id": f"eq.{run_id}",
+                    "stage_key": f"eq.{stage_key}",
+                    "layer_key": f"eq.{layer_key}",
+                    "attempt": f"eq.{attempt}",
+                    "select": "id",
+                    "limit": 1,
+                },
+                timeout=20.0,
+            )
+            if fallback_lookup.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase pipeline_stage_runs lookup failed ({fallback_lookup.status_code}): {fallback_lookup.text}"
                 )
-                if lookup.status_code >= 400:
-                    raise RuntimeError(
-                        f"Supabase pipeline_stage_runs lookup failed ({lookup.status_code}): {lookup.text}"
-                    )
-                rows = lookup.json()
-                if rows:
-                    break
+            rows = fallback_lookup.json()
             if not rows:
                 raise RuntimeError(
                     f"Supabase pipeline_stage_runs conflict without existing row: {response.text}"
@@ -660,14 +698,7 @@ class SupabasePipelineStore(PipelineStore):
                 self._url("pipeline_stage_runs"),
                 headers=self._base_headers,
                 params={"id": f"eq.{existing_id}"},
-                json={
-                    "status": "running",
-                    "started_at": payload["started_at"],
-                    "completed_at": None,
-                    "duration_ms": None,
-                    "records_in": records_in,
-                    "error_json": None,
-                },
+                json=reset_body,
                 timeout=20.0,
             )
             if reset.status_code >= 400:
@@ -675,6 +706,7 @@ class SupabasePipelineStore(PipelineStore):
                     f"Supabase pipeline_stage_runs reset failed ({reset.status_code}): {reset.text}"
                 )
             return existing_id
+
         rows = response.json()
         if not rows:
             raise RuntimeError("Supabase pipeline_stage_runs insert returned empty result")

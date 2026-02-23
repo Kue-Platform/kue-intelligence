@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 BASE_URL = "https://kue-intelligence-tuyb.vercel.app/v1/ingestion/google/oauth/callback/mock"
 TENANT_ID = "tenant_demo"
 USER_ID = "user_demo"
-TRACE_ID = f"trace_realistic_{uuid.uuid4().hex[:10]}"
+TRACE_ID_1 = f"trace_realistic_{uuid.uuid4().hex[:10]}"
+TRACE_ID_2 = f"trace_realistic_{uuid.uuid4().hex[:10]}"
+TRACE_ID_3 = f"trace_realistic_{uuid.uuid4().hex[:10]}"
 
 random.seed(42)
 
@@ -51,7 +53,7 @@ people[:3] = core
 
 now = datetime.now(timezone.utc)
 
-contacts_payload = {"source_type":"contacts","tenant_id":TENANT_ID,"user_id":USER_ID,"trace_id":TRACE_ID,"payload":{"connections":[]}}
+contacts_payload = {"source_type":"contacts","tenant_id":TENANT_ID,"user_id":USER_ID,"trace_id":TRACE_ID_1,"payload":{"connections":[]}}
 for p in people:
     upd = (now - timedelta(days=random.randint(0,180), minutes=random.randint(0,1440))).isoformat().replace("+00:00","Z")
     contacts_payload["payload"]["connections"].append({
@@ -63,7 +65,7 @@ for p in people:
         "metadata": {"sources":[{"type":"CONTACT","id":f"src_{p['id']}", "updateTime": upd}]}
     })
 
-gmail_payload = {"source_type":"gmail","tenant_id":TENANT_ID,"user_id":USER_ID,"trace_id":TRACE_ID,"payload":{"messages":[]}}
+gmail_payload = {"source_type":"gmail","tenant_id":TENANT_ID,"user_id":USER_ID,"trace_id":TRACE_ID_2,"payload":{"messages":[]}}
 subjects = ["Intro request","Quick follow-up","Investor update","Hiring discussion","Partnership idea","Meeting notes","Product feedback","Warm introduction"]
 for i in range(N_THREADS):
     a, b = random.sample(people, 2)
@@ -89,7 +91,7 @@ for i in range(N_THREADS):
         ]}
     })
 
-calendar_payload = {"source_type":"calendar","tenant_id":TENANT_ID,"user_id":USER_ID,"trace_id":TRACE_ID,"payload":{"items":[]}}
+calendar_payload = {"source_type":"calendar","tenant_id":TENANT_ID,"user_id":USER_ID,"trace_id":TRACE_ID_3,"payload":{"items":[]}}
 summaries = ["Coffee chat","Warm intro call","Portfolio sync","Hiring sync","Product review","Investor meeting"]
 for i in range(N_EVENTS):
     attendees = random.sample(people, 3)
@@ -119,13 +121,15 @@ def post(payload):
     )
     print(p.stdout)
 
-print("TRACE_ID:", TRACE_ID)
+print("TRACE_ID:", TRACE_ID_1)
 print("Posting contacts..."); post(contacts_payload); time.sleep(1)
+print("TRACE_ID:", TRACE_ID_2)
 print("Posting gmail..."); post(gmail_payload); time.sleep(1)
+print("TRACE_ID:", TRACE_ID_3)
 print("Posting calendar..."); post(calendar_payload)
 
 print("\nNow check:")
 print("Inngest run for event: kue/user.mock_connected")
-print(f"GET /v1/ingestion/pipeline/run/{TRACE_ID}")
-print(f"GET /v1/ingestion/raw-events/{TRACE_ID}")
-print(f"GET /v1/ingestion/layer3/events/{TRACE_ID}")
+print(f"GET /v1/ingestion/pipeline/run/{TRACE_ID_1}")
+print(f"GET /v1/ingestion/raw-events/{TRACE_ID_2}")
+print(f"GET /v1/ingestion/layer3/events/{TRACE_ID_3}")
