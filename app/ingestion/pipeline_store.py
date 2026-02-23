@@ -407,6 +407,12 @@ class SupabasePipelineStore(PipelineStore):
     def _url(self, table: str) -> str:
         return f"{self._supabase_url}/rest/v1/{table}"
 
+    def _is_duplicate_conflict(self, response: httpx.Response) -> bool:
+        if response.status_code == 409:
+            return True
+        body = (response.text or "").lower()
+        return "23505" in body or "duplicate key value violates unique constraint" in body
+
     def ensure_tenant_user(self, tenant_id: str, user_id: str) -> None:
         now = _utc_now().isoformat()
         tenant_payload = {
@@ -542,29 +548,33 @@ class SupabasePipelineStore(PipelineStore):
             timeout=20.0,
         )
         if response.status_code >= 400:
-            # Graceful fallback for older PostgREST behavior: recover existing row.
-            if response.status_code != 409:
+            # Graceful fallback for strict conflict behavior: recover existing row.
+            if not self._is_duplicate_conflict(response):
                 raise RuntimeError(
                     f"Supabase pipeline_stage_runs insert failed ({response.status_code}): {response.text}"
                 )
-            lookup = httpx.get(
-                self._url("pipeline_stage_runs"),
-                headers=self._base_headers,
-                params={
-                    "run_id": f"eq.{run_id}",
-                    "stage_key": f"eq.{stage_key}",
-                    "layer_key": f"eq.{layer_key}",
-                    "attempt": f"eq.{attempt}",
-                    "select": "id",
-                    "limit": 1,
-                },
-                timeout=20.0,
-            )
-            if lookup.status_code >= 400:
-                raise RuntimeError(
-                    f"Supabase pipeline_stage_runs lookup failed ({lookup.status_code}): {lookup.text}"
+            rows: list[dict[str, Any]] = []
+            for _ in range(3):
+                lookup = httpx.get(
+                    self._url("pipeline_stage_runs"),
+                    headers=self._base_headers,
+                    params={
+                        "run_id": f"eq.{run_id}",
+                        "stage_key": f"eq.{stage_key}",
+                        "layer_key": f"eq.{layer_key}",
+                        "attempt": f"eq.{attempt}",
+                        "select": "id",
+                        "limit": 1,
+                    },
+                    timeout=20.0,
                 )
-            rows = lookup.json()
+                if lookup.status_code >= 400:
+                    raise RuntimeError(
+                        f"Supabase pipeline_stage_runs lookup failed ({lookup.status_code}): {lookup.text}"
+                    )
+                rows = lookup.json()
+                if rows:
+                    break
             if not rows:
                 raise RuntimeError(
                     f"Supabase pipeline_stage_runs conflict without existing row: {response.text}"
