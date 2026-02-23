@@ -47,6 +47,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - `POST /v1/ingestion/stage/canonicalization/replay/{trace_id}`: replay canonicalization stage.
 - `GET /v1/ingestion/layer3/events/{trace_id}`: fetch persisted Layer 3 canonical events by trace id.
 - `GET /v1/ingestion/pipeline/run/{trace_id}`: fetch latest pipeline run status for a trace id.
+- `POST /v1/ingestion/admin/reset`: destructive admin reset endpoint (requires `x-admin-reset-token` header).
 
 ### Layer 1 Test Endpoint Example
 

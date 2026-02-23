@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     inngest_source_app: str = "kue-intelligence"
     inngest_max_retries: int = 5
     alert_webhook_url: str = ""
+    admin_reset_token: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

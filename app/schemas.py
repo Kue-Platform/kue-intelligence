@@ -214,3 +214,9 @@ class PipelineRunStatusResponse(BaseModel):
     requested_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
+
+
+class AdminResetResponse(BaseModel):
+    ok: bool
+    mode: str
+    details: dict[str, Any] = {}

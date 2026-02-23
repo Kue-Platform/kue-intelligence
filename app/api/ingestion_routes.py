@@ -3,7 +3,7 @@ import inspect
 from typing import Awaitable, Callable
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 import inngest
 
 from app.core.config import settings
@@ -21,6 +21,7 @@ from app.ingestion.parsers import parse_raw_events
 from app.ingestion.enrichment import clean_and_enrich_events
 from app.ingestion.entity_resolution import extract_entity_candidates, merge_entity_candidates
 from app.ingestion.entity_store import EntityStore, create_entity_store
+from app.ingestion.admin_reset import reset_all_data
 from app.ingestion.relationship_extraction import compute_relationship_strength, extract_interactions
 from app.ingestion.relationship_store import RelationshipStore, create_relationship_store
 from app.ingestion.validators import validate_parsed_events
@@ -45,6 +46,7 @@ from app.schemas import (
     PipelineRunStatusResponse,
     PipelineRunResponse,
     RawEventsByTraceResponse,
+    AdminResetResponse,
 )
 
 router = APIRouter(prefix="/v1/ingestion", tags=["ingestion"])
@@ -93,6 +95,13 @@ def _get_relationship_store() -> RelationshipStore:
 
 def get_relationship_store() -> RelationshipStore:
     return _get_relationship_store()
+
+
+def _assert_admin_reset_token(token: str | None) -> None:
+    if not settings.admin_reset_token:
+        raise HTTPException(status_code=503, detail="ADMIN_RESET_TOKEN is not configured.")
+    if token != settings.admin_reset_token:
+        raise HTTPException(status_code=401, detail="Invalid admin reset token.")
 
 
 async def _send_inngest_event(*, name: str, data: dict) -> str | None:
@@ -596,3 +605,15 @@ def get_pipeline_run_by_trace(
         started_at=run.started_at,
         completed_at=run.completed_at,
     )
+
+
+@router.post("/admin/reset", response_model=AdminResetResponse)
+def reset_ingestion_data(
+    x_admin_reset_token: str | None = Header(default=None),
+) -> AdminResetResponse:
+    _assert_admin_reset_token(x_admin_reset_token)
+    try:
+        result = reset_all_data(settings)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return AdminResetResponse(ok=result.ok, mode=result.mode, details=result.details)

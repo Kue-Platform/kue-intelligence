@@ -39,8 +39,12 @@ def test_supabase_raw_store_falls_back_on_duplicate_conflict(monkeypatch) -> Non
         calls.append(("PATCH", str(params)))
         return httpx.Response(204, text="")
 
+    def fake_get(url, *, headers=None, params=None, timeout=None):  # type: ignore[no-untyped-def]
+        return httpx.Response(200, json=[{"id": 1}])
+
     monkeypatch.setattr(httpx, "post", fake_post)
     monkeypatch.setattr(httpx, "patch", fake_patch)
+    monkeypatch.setattr(httpx, "get", fake_get)
 
     result = store.persist_source_events([event], run_id="run_1")
     assert result.stored_count == 1
