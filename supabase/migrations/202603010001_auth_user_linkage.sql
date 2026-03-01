@@ -43,7 +43,7 @@ create table if not exists public.org_invitations (
   invited_by    uuid        not null references auth.users(id) on delete cascade,
   email         text        not null,
   role          text        not null default 'member',
-  token         text        not null unique default extensions.encode(extensions.gen_random_bytes(24), 'hex'),
+  token         text        not null unique default gen_random_uuid()::text,
   status        text        not null default 'pending',   -- pending | accepted | revoked | expired
   expires_at    timestamptz not null default (now() + interval '7 days'),
   accepted_at   timestamptz,
