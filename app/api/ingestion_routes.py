@@ -312,26 +312,64 @@ def get_raw_events_by_trace(
 async def run_layer2_capture(
     request: Layer2ManualCaptureRequest,
     dispatch_event: InngestDispatcher = Depends(get_inngest_dispatcher),
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    pipeline_store: PipelineStore = Depends(get_pipeline_store),
 ) -> PipelineRunResponse:
+    """Store-first ingestion: persist source_events to raw_store synchronously,
+    then dispatch a lightweight reference-only Inngest event containing only
+    trace_id / tenant_id / user_id / counts.  This keeps the Inngest payload
+    well under the 256 KB hard limit regardless of batch size.
+    """
     trace_id = request.source_events[0].trace_id if request.source_events else None
     if trace_id is None:
         raise HTTPException(status_code=400, detail="source_events must include trace_id")
+
+    tenant_id = request.source_events[0].tenant_id
+    user_id = request.source_events[0].user_id
+    source = str(request.source_events[0].source)
+
+    # 1. Create a pipeline run record so the raw store rows carry a run_id.
+    pipeline_store.ensure_tenant_user(tenant_id, user_id)
+    run_id = pipeline_store.create_pipeline_run(
+        trace_id=trace_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        source=request.source_events[0].source,
+        trigger_type="pipeline/run.requested",
+        source_event_id=str(request.source_events[0].source_event_id),
+        metadata={"event_name": "pipeline/run.requested", "ingest_path": "layer2/capture"},
+    )
+
+    # 2. Persist all source events to the raw store (Supabase in prod).
+    try:
+        raw_store.persist_source_events(
+            request.source_events,
+            run_id=run_id,
+            ingest_version="v1",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Raw store persist failed: {exc}") from exc
+
+    # 3. Dispatch a tiny reference event — no source_events blob.
     try:
         event_id = await dispatch_event(
             "pipeline/run.requested",
             {
                 "trace_id": trace_id,
-                "tenant_id": request.source_events[0].tenant_id,
-                "user_id": request.source_events[0].user_id,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "run_id": run_id,
+                "source": source,
+                "source_count": len(request.source_events),
                 "parser_version": settings.parser_version,
-                "source_events": [event.model_dump(mode="json") for event in request.source_events],
-                "source": str(request.source_events[0].source),
+                # source_events intentionally omitted — already in raw_store
             },
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Inngest dispatch failed: {exc}") from exc
+
     return PipelineRunResponse(
-        run_id=None,
+        run_id=run_id,
         event_name="pipeline/run.requested",
         event_id=event_id,
         trace_id=trace_id,

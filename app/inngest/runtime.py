@@ -106,6 +106,12 @@ def _validate_oauth_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _fetch_google_source_events_from_oauth(data: dict[str, Any]) -> dict[str, Any]:
+    """Fetch Google source events via OAuth, persist to raw_store immediately,
+    and return only counts.  This prevents large step-return payloads from
+    hitting Inngest's 256 KB serialization limit.
+    """
+    from app.core.config import settings as _settings
+
     connector = GoogleOAuthConnector()
     source_events = await connector.handle_callback(
         code=str(data["code"]),
@@ -115,13 +121,22 @@ async def _fetch_google_source_events_from_oauth(data: dict[str, Any]) -> dict[s
             trace_id=str(data["trace_id"]),
         ),
     )
+    # Persist here so the rest of the pipeline reads from the store by trace_id.
+    store = create_raw_event_store(_settings)
+    store.persist_source_events(source_events, ingest_version="v1")
     return {
         "count": len(source_events),
-        "source_events": [event.model_dump(mode="json") for event in source_events],
+        "pre_stored": True,
+        # source_events intentionally omitted — already in raw_store
     }
 
 
 def _fetch_google_source_events_from_mock(data: dict[str, Any]) -> dict[str, Any]:
+    """Fetch mock Google source events, persist to raw_store immediately,
+    and return only counts.  Same store-first pattern as the OAuth path.
+    """
+    from app.core.config import settings as _settings
+
     connector = GoogleOAuthConnector()
     source_events = connector.handle_mock_callback(
         context=GoogleOAuthContext(
@@ -132,9 +147,13 @@ def _fetch_google_source_events_from_mock(data: dict[str, Any]) -> dict[str, Any
         source_type=GoogleMockSourceType(str(data["source_type"])),
         payload=dict(data["payload"]),
     )
+    # Persist here so the rest of the pipeline reads from the store by trace_id.
+    store = create_raw_event_store(_settings)
+    store.persist_source_events(source_events, ingest_version="v1")
     return {
         "count": len(source_events),
-        "source_events": [event.model_dump(mode="json") for event in source_events],
+        "pre_stored": True,
+        # source_events intentionally omitted — already in raw_store
     }
 
 
@@ -597,6 +616,19 @@ def _ensure_pipeline_run(
     tenant_id = str(data["tenant_id"])
     user_id = str(data["user_id"])
     trace_id = str(data["trace_id"])
+
+    # If the HTTP handler already created a pipeline run (store-first path),
+    # skip creation and reuse the provided run_id.
+    existing_run_id = data.get("run_id")
+    if existing_run_id:
+        return {
+            "run_id": str(existing_run_id),
+            "trace_id": trace_id,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "pre_stored": True,
+        }
+
     source = _resolve_source_hint(data, source_events_payload or [])
     source_event_id = None
     if source_events_payload:
@@ -614,7 +646,7 @@ def _ensure_pipeline_run(
         source_event_id=source_event_id,
         metadata={"event_name": trigger_type},
     )
-    return {"run_id": run_id, "trace_id": trace_id, "tenant_id": tenant_id, "user_id": user_id}
+    return {"run_id": run_id, "trace_id": trace_id, "tenant_id": tenant_id, "user_id": user_id, "pre_stored": False}
 
 
 def _run_layer_internal(
@@ -995,21 +1027,33 @@ async def _run_pipeline_core(
     trace_id = str(run_info["trace_id"])
     tenant_id = str(run_info["tenant_id"])
     user_id = str(run_info["user_id"])
-    tenant_id = str(run_info["tenant_id"])
-    user_id = str(run_info["user_id"])
+    # pre_stored=True when the HTTP handler already persisted events (store-first path).
+    # For layer2/capture: run_info["pre_stored"] is set via run_id in event data.
+    # For OAuth paths: data["pre_stored"] is set by the fetch step before calling here.
+    pre_stored = bool(run_info.get("pre_stored", False)) or bool(data.get("pre_stored", False))
     try:
-        await ctx.step.run(
-            "stage.raw_capture.layer.validate",
-            _layer_validate_source_events,
-            run_id,
-            source_events_payload,
-        )
-        raw_result = await ctx.step.run(
-            "stage.raw_capture.layer.persist",
-            _layer_persist_raw_events,
-            run_id,
-            source_events_payload,
-        )
+        if pre_stored:
+            # Events are already in the raw store — skip validate + persist steps.
+            # Use source_count from the event data for the summary record.
+            raw_result = {
+                "stored_count": int(data.get("source_count", 0)),
+                "trace_id": trace_id,
+                "run_id": run_id,
+                "store": "pre_stored",
+            }
+        else:
+            await ctx.step.run(
+                "stage.raw_capture.layer.validate",
+                _layer_validate_source_events,
+                run_id,
+                source_events_payload,
+            )
+            raw_result = await ctx.step.run(
+                "stage.raw_capture.layer.persist",
+                _layer_persist_raw_events,
+                run_id,
+                source_events_payload,
+            )
 
         raw_process = await ctx.step.run(
             "stage.canonicalization.layer.fetch_and_process",
@@ -1204,17 +1248,20 @@ async def ingestion_pipeline_run(ctx: inngest.Context) -> dict[str, Any]:
     on_failure=_alert_on_failure,
 )
 async def ingestion_user_connected(ctx: inngest.Context) -> dict[str, Any]:
-    data = ctx.event.data or {}
+    data = dict(ctx.event.data or {})
     parser_version = str(data.get("parser_version") or settings.parser_version)
 
     await ctx.step.run("stage.intake.layer.validate_payload", _validate_oauth_payload, data)
     fetched = await ctx.step.run("stage.intake.layer.fetch_google", _fetch_google_source_events_from_oauth, data)
+    # Merge fetch metadata into data so _run_pipeline_core knows events are pre-stored.
+    data["source_count"] = fetched.get("count", 0)
+    data["pre_stored"] = fetched.get("pre_stored", False)
     return await _run_pipeline_core(
         ctx,
         data=data,
         trigger_type="kue/user.connected",
         parser_version=parser_version,
-        source_events_payload=list(fetched.get("source_events", [])),
+        source_events_payload=[],
     )
 
 
@@ -1225,17 +1272,20 @@ async def ingestion_user_connected(ctx: inngest.Context) -> dict[str, Any]:
     on_failure=_alert_on_failure,
 )
 async def ingestion_user_mock_connected(ctx: inngest.Context) -> dict[str, Any]:
-    data = ctx.event.data or {}
+    data = dict(ctx.event.data or {})
     parser_version = str(data.get("parser_version") or settings.parser_version)
 
     await ctx.step.run("stage.intake.layer.validate_payload", _validate_oauth_payload, data)
     fetched = await ctx.step.run("stage.intake.layer.fetch_mock", _fetch_google_source_events_from_mock, data)
+    # Merge fetch metadata into data so _run_pipeline_core knows events are pre-stored.
+    data["source_count"] = fetched.get("count", 0)
+    data["pre_stored"] = fetched.get("pre_stored", False)
     return await _run_pipeline_core(
         ctx,
         data=data,
         trigger_type="kue/user.mock_connected",
         parser_version=parser_version,
-        source_events_payload=list(fetched.get("source_events", [])),
+        source_events_payload=[],
     )
 
 
