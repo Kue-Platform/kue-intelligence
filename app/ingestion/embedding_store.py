@@ -133,58 +133,74 @@ class SupabaseEmbeddingStore(EmbeddingStore):
     def _url(self, table: str) -> str:
         return f"{self._supabase_url}/rest/v1/{table}"
 
-    def _resolve_entity_id(self, tenant_id: str, email: str) -> str | None:
+    def _bulk_resolve_entity_ids(self, tenant_id: str, emails: list[str]) -> dict[str, str]:
+        """Return {primary_email -> entity_id} for all given emails in one GET."""
+        if not emails:
+            return {}
         response = httpx.get(
             self._url("entities"),
             headers=self._base_headers,
             params={
                 "tenant_id": f"eq.{tenant_id}",
-                "primary_email": f"eq.{email}",
-                "select": "entity_id",
-                "limit": 1,
+                "primary_email": f"in.({','.join(emails)})",
+                "select": "primary_email,entity_id",
             },
-            timeout=20.0,
+            timeout=30.0,
         )
         if response.status_code >= 400:
             raise RuntimeError(
-                f"Supabase entity lookup for embeddings failed ({response.status_code}): {response.text}"
+                f"Supabase entity bulk lookup for embeddings failed ({response.status_code}): {response.text}"
             )
-        rows = response.json()
-        if not rows:
-            return None
-        return str(rows[0]["entity_id"])
+        return {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
 
     def persist_vectors(self, records: list[EmbeddingVectorRecord]) -> EmbeddingPersistResult:
         if not records:
             return EmbeddingPersistResult(0, 0)
+
+        from collections import defaultdict
+        by_tenant: dict[str, list[EmbeddingVectorRecord]] = defaultdict(list)
+        for item in records:
+            by_tenant[item.tenant_id].append(item)
+
         persisted = 0
         skipped = 0
-        for item in records:
-            if not item.primary_email:
-                skipped += 1
+
+        for tenant_id, items in by_tenant.items():
+            valid = [i for i in items if i.primary_email]
+            skipped += len(items) - len(valid)
+            if not valid:
                 continue
-            entity_id = self._resolve_entity_id(item.tenant_id, item.primary_email)
-            if not entity_id:
-                skipped += 1
-                continue
-            vector_literal = "[" + ",".join(f"{v:.6f}" for v in item.embedding) + "]"
-            response = httpx.patch(
-                self._url("search_documents"),
-                headers=self._base_headers,
-                params={
-                    "tenant_id": f"eq.{item.tenant_id}",
-                    "entity_id": f"eq.{entity_id}",
-                    "doc_type": f"eq.{item.doc_type}",
-                    "content": f"eq.{item.content}",
-                },
-                json={"embedding": vector_literal},
-                timeout=30.0,
-            )
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Supabase embedding persist failed ({response.status_code}): {response.text}"
+
+            # ── 1. Bulk-resolve entity IDs (1 GET per tenant) ─────────────────
+            emails = list({i.primary_email for i in valid})
+            email_to_id = self._bulk_resolve_entity_ids(tenant_id, emails)
+
+            # ── 2. PATCH embedding vector per record (unavoidable: each is unique) ──
+            for item in valid:
+                entity_id = email_to_id.get(item.primary_email)
+                if not entity_id:
+                    skipped += 1
+                    continue
+                # pgvector expects a literal string like '[0.1,0.2,...]'
+                vector_literal = "[" + ",".join(f"{v:.6f}" for v in item.embedding) + "]"
+                response = httpx.patch(
+                    self._url("search_documents"),
+                    headers=self._base_headers,
+                    params={
+                        "tenant_id": f"eq.{item.tenant_id}",
+                        "entity_id": f"eq.{entity_id}",
+                        "doc_type": f"eq.{item.doc_type}",
+                        "content":  f"eq.{item.content}",
+                    },
+                    json={"embedding": vector_literal},
+                    timeout=30.0,
                 )
-            persisted += 1
+                if response.status_code >= 400:
+                    raise RuntimeError(
+                        f"Supabase embedding persist failed ({response.status_code}): {response.text}"
+                    )
+                persisted += 1
+
         return EmbeddingPersistResult(persisted, skipped)
 
 

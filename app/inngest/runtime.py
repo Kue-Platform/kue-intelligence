@@ -383,23 +383,12 @@ def _cache_enrichment(enrichment_payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _cache_embeddings(vectors_payload: dict[str, Any]) -> dict[str, Any]:
-    records = list(vectors_payload.get("records", []))
-    cached = 0
-    for record in records:
-        tenant_id = str(record.get("tenant_id") or "").strip()
-        doc_type = str(record.get("doc_type") or "").strip()
-        content = str(record.get("content") or "").strip()
-        if not tenant_id or not doc_type or not content:
-            continue
-        key = f"{tenant_id}:{doc_type}:{content}"
-        cache_registry.put(
-            namespace="embedding",
-            version="v1",
-            key=key,
-            value={"embedding": list(record.get("embedding", []))},
-        )
-        cached += 1
-    return {"cached_count": cached}
+    # TODO: Re-enable when Redis is introduced.
+    # The in-memory InMemoryCacheRegistry is reset on every Inngest step invocation
+    # (each step is a fresh process/worker), so writes here are immediately lost.
+    # Keeping the step registered so the pipeline chain stays intact.
+    del vectors_payload
+    return {"cached_count": 0}
 
 
 def _cache_metrics_snapshot() -> dict[str, Any]:
