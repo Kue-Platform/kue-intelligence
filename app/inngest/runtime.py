@@ -281,6 +281,45 @@ def _persist_relationships(
     }
 
 
+def _process_enrichment(enrichment_payload: dict[str, Any]) -> dict[str, Any]:
+    """Run all pure-Python enrichment transforms in one pass (no I/O).
+
+    Replaces 7 separate Inngest steps (exact_match, merge_entities,
+    extract_metadata, build_search_documents, extract_interactions,
+    compute_relationship_strength, cache_enrichment) that each caused a
+    full enrichment_result serialize/deserialize round-trip for zero benefit.
+    """
+    # Entity resolution (contact events only)
+    entity_exact = extract_entity_candidates(enrichment_payload)
+    entity_merged = merge_entity_candidates(entity_exact.model_dump(mode="json"))
+
+    # Metadata extraction (contact events only)
+    metadata = extract_metadata_candidates(enrichment_payload)
+
+    # Semantic document preparation (all event types)
+    semantic = build_semantic_documents(enrichment_payload)
+
+    # Interaction + relationship extraction (email + calendar events)
+    interactions = extract_interactions(enrichment_payload)
+    relationships = compute_relationship_strength(interactions.model_dump(mode="json"))
+
+    return {
+        # Shaped to match the payload keys the existing persist ops already expect:
+        "merge_result":    entity_merged.model_dump(mode="json"),
+        "metadata_result": metadata.model_dump(mode="json"),
+        "semantic_result": semantic.model_dump(mode="json"),
+        "extract_result":  interactions.model_dump(mode="json"),
+        "strength_result": relationships.model_dump(mode="json"),
+        # Counts surfaced for summary / records_in tracking:
+        "entity_candidate_count": entity_exact.candidate_count,
+        "resolved_count":         entity_merged.resolved_count,
+        "metadata_count":         metadata.candidate_count,
+        "document_count":         semantic.document_count,
+        "interaction_count":      interactions.interaction_count,
+        "relationship_count":     relationships.relationship_count,
+    }
+
+
 def _persist_metadata(metadata_payload: dict[str, Any]) -> dict[str, Any]:
     from app.ingestion.metadata_extraction import MetadataCandidate
 
@@ -554,27 +593,17 @@ def _run_layer_internal(
             result = validate_parsed_events(dict(payload["parse_result"])).model_dump(mode="json")
         elif op == "clean_and_enrich":
             result = clean_and_enrich_events(dict(payload["validation_result"])).model_dump(mode="json")
-        elif op == "entity_exact_match":
-            result = extract_entity_candidates(dict(payload["enrichment_result"])).model_dump(mode="json")
-        elif op == "entity_merge":
-            result = merge_entity_candidates(dict(payload["exact_match_result"])).model_dump(mode="json")
+        elif op == "process_enrichment":
+            result = _process_enrichment(dict(payload["enrichment_result"]))
         elif op == "entity_persist":
             result = _persist_entities(dict(payload["merge_result"]))
-        elif op == "extract_interactions":
-            result = extract_interactions(dict(payload["enrichment_result"])).model_dump(mode="json")
-        elif op == "compute_relationship_strength":
-            result = compute_relationship_strength(dict(payload["extract_result"])).model_dump(mode="json")
         elif op == "persist_relationships":
             result = _persist_relationships(
                 dict(payload["extract_result"]),
                 dict(payload["strength_result"]),
             )
-        elif op == "extract_metadata":
-            result = extract_metadata_candidates(dict(payload["enrichment_result"])).model_dump(mode="json")
         elif op == "persist_metadata":
             result = _persist_metadata(dict(payload["metadata_result"]))
-        elif op == "build_semantic_documents":
-            result = build_semantic_documents(dict(payload["enrichment_result"])).model_dump(mode="json")
         elif op == "persist_semantic_documents":
             result = _persist_semantic_documents(dict(payload["semantic_result"]))
         elif op == "embedding_cache_lookup":
@@ -585,8 +614,6 @@ def _run_layer_internal(
             result = _embedding_cache_store(dict(payload["vectors_result"]))
         elif op == "embedding_persist":
             result = _persist_embeddings(dict(payload["vectors_result"]))
-        elif op == "cache_enrichment":
-            result = _cache_enrichment(dict(payload["enrichment_result"]))
         elif op == "cache_embeddings":
             result = _cache_embeddings(dict(payload["vectors_result"]))
         elif op == "cache_metrics_snapshot":
@@ -726,25 +753,14 @@ def _layer_clean_and_enrich(run_id: str, validation_result: dict[str, Any]) -> d
     )
 
 
-def _layer_entity_exact_match(run_id: str, enrichment_result: dict[str, Any]) -> dict[str, Any]:
+def _layer_process_enrichment(run_id: str, enrichment_result: dict[str, Any]) -> dict[str, Any]:
     return _run_layer_internal(
         run_id=run_id,
-        stage_key="entity_resolution",
-        layer_key="exact_match",
+        stage_key="enrichment",
+        layer_key="process_all",
         records_in=int(enrichment_result.get("enriched_count", 0)),
-        op="entity_exact_match",
+        op="process_enrichment",
         payload={"enrichment_result": enrichment_result},
-    )
-
-
-def _layer_entity_merge(run_id: str, exact_match_result: dict[str, Any]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="entity_resolution",
-        layer_key="merge_entities",
-        records_in=int(exact_match_result.get("candidate_count", 0)),
-        op="entity_merge",
-        payload={"exact_match_result": exact_match_result},
     )
 
 
@@ -756,28 +772,6 @@ def _layer_entity_persist(run_id: str, merge_result: dict[str, Any]) -> dict[str
         records_in=int(merge_result.get("resolved_count", 0)),
         op="entity_persist",
         payload={"merge_result": merge_result},
-    )
-
-
-def _layer_extract_interactions(run_id: str, enrichment_result: dict[str, Any]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="relationship_extraction",
-        layer_key="extract_interactions",
-        records_in=int(enrichment_result.get("enriched_count", 0)),
-        op="extract_interactions",
-        payload={"enrichment_result": enrichment_result},
-    )
-
-
-def _layer_compute_relationship_strength(run_id: str, extract_result: dict[str, Any]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="relationship_extraction",
-        layer_key="compute_strength",
-        records_in=int(extract_result.get("interaction_count", 0)),
-        op="compute_relationship_strength",
-        payload={"extract_result": extract_result},
     )
 
 
@@ -882,18 +876,6 @@ def _layer_embedding_persist(run_id: str, vectors_result: dict[str, Any]) -> dic
         op="embedding_persist",
         payload={"vectors_result": vectors_result},
     )
-
-
-def _layer_cache_enrichment(run_id: str, enrichment_result: dict[str, Any]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="caching",
-        layer_key="write_enrichment_cache",
-        records_in=int(enrichment_result.get("enriched_count", 0)),
-        op="cache_enrichment",
-        payload={"enrichment_result": enrichment_result},
-    )
-
 
 def _layer_cache_embeddings(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
     return _run_layer_internal(
@@ -1095,53 +1077,35 @@ async def _run_pipeline_core(
             enrichment_result,
             parser_version,
         )
-        entity_exact = await ctx.step.run(
-            "stage.entity_resolution.layer.exact_match",
-            _layer_entity_exact_match,
+        process_result = await ctx.step.run(
+            "stage.enrichment.layer.process_all",
+            _layer_process_enrichment,
             run_id,
             enrichment_result,
-        )
-        entity_merge = await ctx.step.run(
-            "stage.entity_resolution.layer.merge_entities",
-            _layer_entity_merge,
-            run_id,
-            entity_exact,
         )
         entity_persist = await ctx.step.run(
             "stage.entity_resolution.layer.persist_entities",
             _layer_entity_persist,
             run_id,
-            entity_merge,
-        )
-        metadata_result = await ctx.step.run(
-            "stage.metadata_extraction.layer.extract_tags",
-            _layer_extract_metadata,
-            run_id,
-            enrichment_result,
+            process_result["merge_result"],
         )
         metadata_persist = await ctx.step.run(
             "stage.metadata_extraction.layer.persist_metadata",
             _layer_persist_metadata,
             run_id,
-            metadata_result,
-        )
-        semantic_result = await ctx.step.run(
-            "stage.semantic_prep.layer.build_search_documents",
-            _layer_build_semantic_documents,
-            run_id,
-            enrichment_result,
+            process_result["metadata_result"],
         )
         semantic_persist = await ctx.step.run(
             "stage.semantic_prep.layer.persist_search_documents",
             _layer_persist_semantic_documents,
             run_id,
-            semantic_result,
+            process_result["semantic_result"],
         )
         embedding_lookup = await ctx.step.run(
             "stage.embedding.layer.cache_lookup",
             _layer_embedding_cache_lookup,
             run_id,
-            semantic_result,
+            process_result["semantic_result"],
         )
         embedding_vectors = await ctx.step.run(
             "stage.embedding.layer.generate_vectors",
@@ -1160,12 +1124,6 @@ async def _run_pipeline_core(
             _layer_embedding_persist,
             run_id,
             embedding_vectors,
-        )
-        caching_enrichment = await ctx.step.run(
-            "stage.caching.layer.write_enrichment_cache",
-            _layer_cache_enrichment,
-            run_id,
-            enrichment_result,
         )
         caching_embeddings = await ctx.step.run(
             "stage.caching.layer.write_embedding_cache",
@@ -1190,24 +1148,12 @@ async def _run_pipeline_core(
             run_id,
             hybrid_signals,
         )
-        interactions = await ctx.step.run(
-            "stage.relationship_extraction.layer.extract_interactions",
-            _layer_extract_interactions,
-            run_id,
-            enrichment_result,
-        )
-        strengths = await ctx.step.run(
-            "stage.relationship_extraction.layer.compute_strength",
-            _layer_compute_relationship_strength,
-            run_id,
-            interactions,
-        )
         relationship_persist = await ctx.step.run(
             "stage.relationship_extraction.layer.persist_relationships",
             _layer_persist_relationships,
             run_id,
-            interactions,
-            strengths,
+            process_result["extract_result"],
+            process_result["strength_result"],
         )
         graph_prepare = await ctx.step.run(
             "stage.graph_projection.layer.prepare",
@@ -1260,15 +1206,15 @@ async def _run_pipeline_core(
                 "enriched_count": enrichment_result.get("enriched_count", 0),
             },
             "entity_resolution": {
-                "candidate_count": entity_exact.get("candidate_count", 0),
-                "resolved_count": entity_merge.get("resolved_count", 0),
+                "candidate_count": process_result.get("entity_candidate_count", 0),
+                "resolved_count": process_result.get("resolved_count", 0),
                 **entity_persist,
             },
             "metadata_extraction": {
                 **metadata_persist,
             },
             "semantic_prep": {
-                "document_count": semantic_result.get("document_count", 0),
+                "document_count": process_result.get("document_count", 0),
                 **semantic_persist,
             },
             "embedding": {
@@ -1279,7 +1225,6 @@ async def _run_pipeline_core(
                 **embedding_persist,
             },
             "caching": {
-                "enrichment_cached_count": caching_enrichment.get("cached_count", 0),
                 "embedding_cached_count": caching_embeddings.get("cached_count", 0),
                 **caching_metrics,
             },
@@ -1288,8 +1233,8 @@ async def _run_pipeline_core(
                 **search_index_result,
             },
             "relationship_extraction": {
-                "interaction_count": interactions.get("interaction_count", 0),
-                "relationship_count": strengths.get("relationship_count", 0),
+                "interaction_count": process_result.get("interaction_count", 0),
+                "relationship_count": process_result.get("relationship_count", 0),
                 **relationship_persist,
             },
             "graph_projection": {
@@ -1421,53 +1366,35 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             enrichment_result,
             parser_version,
         )
-        entity_exact = await ctx.step.run(
-            "stage.entity_resolution.layer.exact_match",
-            _layer_entity_exact_match,
+        process_result = await ctx.step.run(
+            "stage.enrichment.layer.process_all",
+            _layer_process_enrichment,
             run_id,
             enrichment_result,
-        )
-        entity_merge = await ctx.step.run(
-            "stage.entity_resolution.layer.merge_entities",
-            _layer_entity_merge,
-            run_id,
-            entity_exact,
         )
         entity_persist = await ctx.step.run(
             "stage.entity_resolution.layer.persist_entities",
             _layer_entity_persist,
             run_id,
-            entity_merge,
-        )
-        metadata_result = await ctx.step.run(
-            "stage.metadata_extraction.layer.extract_tags",
-            _layer_extract_metadata,
-            run_id,
-            enrichment_result,
+            process_result["merge_result"],
         )
         metadata_persist = await ctx.step.run(
             "stage.metadata_extraction.layer.persist_metadata",
             _layer_persist_metadata,
             run_id,
-            metadata_result,
-        )
-        semantic_result = await ctx.step.run(
-            "stage.semantic_prep.layer.build_search_documents",
-            _layer_build_semantic_documents,
-            run_id,
-            enrichment_result,
+            process_result["metadata_result"],
         )
         semantic_persist = await ctx.step.run(
             "stage.semantic_prep.layer.persist_search_documents",
             _layer_persist_semantic_documents,
             run_id,
-            semantic_result,
+            process_result["semantic_result"],
         )
         embedding_lookup = await ctx.step.run(
             "stage.embedding.layer.cache_lookup",
             _layer_embedding_cache_lookup,
             run_id,
-            semantic_result,
+            process_result["semantic_result"],
         )
         embedding_vectors = await ctx.step.run(
             "stage.embedding.layer.generate_vectors",
@@ -1486,12 +1413,6 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             _layer_embedding_persist,
             run_id,
             embedding_vectors,
-        )
-        caching_enrichment = await ctx.step.run(
-            "stage.caching.layer.write_enrichment_cache",
-            _layer_cache_enrichment,
-            run_id,
-            enrichment_result,
         )
         caching_embeddings = await ctx.step.run(
             "stage.caching.layer.write_embedding_cache",
@@ -1516,24 +1437,12 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             run_id,
             hybrid_signals,
         )
-        interactions = await ctx.step.run(
-            "stage.relationship_extraction.layer.extract_interactions",
-            _layer_extract_interactions,
-            run_id,
-            enrichment_result,
-        )
-        strengths = await ctx.step.run(
-            "stage.relationship_extraction.layer.compute_strength",
-            _layer_compute_relationship_strength,
-            run_id,
-            interactions,
-        )
         relationship_persist = await ctx.step.run(
             "stage.relationship_extraction.layer.persist_relationships",
             _layer_persist_relationships,
             run_id,
-            interactions,
-            strengths,
+            process_result["extract_result"],
+            process_result["strength_result"],
         )
         graph_prepare = await ctx.step.run(
             "stage.graph_projection.layer.prepare",
@@ -1581,15 +1490,15 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
                 "enriched_count": enrichment_result.get("enriched_count", 0),
             },
             "entity_resolution": {
-                "candidate_count": entity_exact.get("candidate_count", 0),
-                "resolved_count": entity_merge.get("resolved_count", 0),
+                "candidate_count": process_result.get("entity_candidate_count", 0),
+                "resolved_count": process_result.get("resolved_count", 0),
                 **entity_persist,
             },
             "metadata_extraction": {
                 **metadata_persist,
             },
             "semantic_prep": {
-                "document_count": semantic_result.get("document_count", 0),
+                "document_count": process_result.get("document_count", 0),
                 **semantic_persist,
             },
             "embedding": {
@@ -1600,7 +1509,6 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
                 **embedding_persist,
             },
             "caching": {
-                "enrichment_cached_count": caching_enrichment.get("cached_count", 0),
                 "embedding_cached_count": caching_embeddings.get("cached_count", 0),
                 **caching_metrics,
             },
@@ -1609,8 +1517,8 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
                 **search_index_result,
             },
             "relationship_extraction": {
-                "interaction_count": interactions.get("interaction_count", 0),
-                "relationship_count": strengths.get("relationship_count", 0),
+                "interaction_count": process_result.get("interaction_count", 0),
+                "relationship_count": process_result.get("relationship_count", 0),
                 **relationship_persist,
             },
             "graph_projection": {
