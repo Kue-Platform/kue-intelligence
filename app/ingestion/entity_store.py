@@ -503,47 +503,65 @@ class SupabaseEntityStore(EntityStore):
     def upsert_metadata(self, metadata_candidates: list[MetadataCandidate]) -> int:
         if not metadata_candidates:
             return 0
-        updated = 0
+
+        from collections import defaultdict
+        # Group by tenant (almost always one, but be safe)
+        by_tenant: dict[str, list[MetadataCandidate]] = defaultdict(list)
         for item in metadata_candidates:
-            lookup = httpx.get(
+            if item.primary_email:
+                by_tenant[item.tenant_id].append(item)
+
+        updated = 0
+
+        for tenant_id, items in by_tenant.items():
+            emails = [item.primary_email for item in items]
+
+            # ── 1. Bulk-fetch all matching entities in one GET ─────────────────
+            existing_resp = httpx.get(
                 self._url("entities"),
                 headers=self._base_headers,
                 params={
-                    "tenant_id": f"eq.{item.tenant_id}",
-                    "primary_email": f"eq.{item.primary_email}",
-                    "select": "entity_id,metadata_json",
-                    "limit": 1,
+                    "tenant_id": f"eq.{tenant_id}",
+                    "primary_email": f"in.({','.join(emails)})",
+                    "select": "entity_id,primary_email,metadata_json",
                 },
-                timeout=20.0,
+                timeout=30.0,
             )
-            if lookup.status_code >= 400:
+            if existing_resp.status_code >= 400:
                 raise RuntimeError(
-                    f"Supabase entities metadata lookup failed ({lookup.status_code}): {lookup.text}"
+                    f"Supabase entities metadata bulk fetch failed ({existing_resp.status_code}): {existing_resp.text}"
                 )
-            rows = lookup.json()
-            if not rows:
-                continue
-            existing = rows[0]
-            merged_metadata = dict(existing.get("metadata_json") or {})
-            merged_metadata.update(item.metadata_json)
-            patch = httpx.patch(
-                self._url("entities"),
-                headers=self._base_headers,
-                params={"entity_id": f"eq.{existing['entity_id']}"},
-                json={
-                    "display_name": item.display_name,
-                    "company_norm": item.metadata_json.get("company_norm"),
-                    "title_norm": item.metadata_json.get("title_norm"),
-                    "metadata_json": merged_metadata,
-                },
-                timeout=20.0,
-            )
-            if patch.status_code >= 400:
-                raise RuntimeError(
-                    f"Supabase entities metadata update failed ({patch.status_code}): {patch.text}"
+            existing_by_email: dict[str, dict] = {
+                row["primary_email"]: row for row in existing_resp.json()
+            }
+
+            # ── 2. PATCH each matched entity ───────────────────────────────────
+            for item in items:
+                existing = existing_by_email.get(item.primary_email)
+                if not existing:
+                    continue
+                merged_metadata = dict(existing.get("metadata_json") or {})
+                merged_metadata.update(item.metadata_json)
+                patch = httpx.patch(
+                    self._url("entities"),
+                    headers=self._base_headers,
+                    params={"entity_id": f"eq.{existing['entity_id']}"},
+                    json={
+                        "display_name": item.display_name,
+                        "company_norm": item.metadata_json.get("company_norm"),
+                        "title_norm": item.metadata_json.get("title_norm"),
+                        "metadata_json": merged_metadata,
+                    },
+                    timeout=20.0,
                 )
-            updated += 1
+                if patch.status_code >= 400:
+                    raise RuntimeError(
+                        f"Supabase entities metadata update failed ({patch.status_code}): {patch.text}"
+                    )
+                updated += 1
+
         return updated
+
 
 
 def create_entity_store(settings: Settings) -> EntityStore:
