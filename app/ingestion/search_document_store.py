@@ -135,51 +135,64 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
     def _url(self, table: str) -> str:
         return f"{self._supabase_url}/rest/v1/{table}"
 
-    def _resolve_entity_id(self, tenant_id: str, email: str) -> str | None:
+    def _bulk_resolve_entity_ids(self, tenant_id: str, emails: list[str]) -> dict[str, str]:
+        """Return {primary_email -> entity_id} for all given emails in one GET."""
+        if not emails:
+            return {}
         response = httpx.get(
             self._url("entities"),
             headers=self._base_headers,
             params={
                 "tenant_id": f"eq.{tenant_id}",
-                "primary_email": f"eq.{email}",
-                "select": "entity_id",
-                "limit": 1,
+                "primary_email": f"in.({','.join(emails)})",
+                "select": "primary_email,entity_id",
             },
-            timeout=20.0,
+            timeout=30.0,
         )
         if response.status_code >= 400:
             raise RuntimeError(
-                f"Supabase entities lookup for search docs failed ({response.status_code}): {response.text}"
+                f"Supabase entities bulk lookup failed ({response.status_code}): {response.text}"
             )
-        rows = response.json()
-        if not rows:
-            return None
-        return str(rows[0]["entity_id"])
+        return {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
 
     def persist_documents(self, documents: list[SemanticDocument]) -> SearchDocumentPersistResult:
         if not documents:
             return SearchDocumentPersistResult(0, 0, 0)
+
+        from collections import defaultdict
+        by_tenant: dict[str, list[SemanticDocument]] = defaultdict(list)
+        for doc in documents:
+            by_tenant[doc.tenant_id].append(doc)
+
         payload: list[dict[str, Any]] = []
         skipped = 0
-        for doc in documents:
-            email = doc.primary_email or ""
-            if not email:
-                skipped += 1
+
+        for tenant_id, docs in by_tenant.items():
+            # ── 1. Bulk-resolve all entity IDs in one GET per tenant ───────────
+            emails = [doc.primary_email for doc in docs if doc.primary_email]
+            skipped += sum(1 for doc in docs if not doc.primary_email)
+            if not emails:
                 continue
-            entity_id = self._resolve_entity_id(doc.tenant_id, email)
-            if not entity_id:
-                skipped += 1
-                continue
-            payload.append(
-                {
+            email_to_id = self._bulk_resolve_entity_ids(tenant_id, emails)
+
+            # ── 2. Build insert payload ────────────────────────────────────────
+            for doc in docs:
+                if not doc.primary_email:
+                    continue
+                entity_id = email_to_id.get(doc.primary_email)
+                if not entity_id:
+                    skipped += 1
+                    continue
+                payload.append({
                     "tenant_id": doc.tenant_id,
                     "entity_id": entity_id,
                     "doc_type": doc.doc_type,
                     "content": doc.content,
                     "metadata_json": doc.metadata_json,
                     "source_updated_at": doc.source_updated_at,
-                }
-            )
+                })
+
+        # ── 3. Bulk insert all documents in one POST ───────────────────────────
         if payload:
             response = httpx.post(
                 self._url("search_documents"),

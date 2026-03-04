@@ -173,98 +173,142 @@ class SupabaseSearchIndexStore(SearchIndexStore):
     def _url(self, table: str) -> str:
         return f"{self._supabase_url}/rest/v1/{table}"
 
-    def _resolve_entity_id(self, tenant_id: str, email: str) -> str | None:
+    def _bulk_resolve_entity_ids(self, tenant_id: str, emails: list[str]) -> dict[str, str]:
+        """Return {primary_email -> entity_id} for all given emails in one GET."""
+        if not emails:
+            return {}
         response = httpx.get(
             self._url("entities"),
             headers=self._base_headers,
             params={
                 "tenant_id": f"eq.{tenant_id}",
-                "primary_email": f"eq.{email}",
-                "select": "entity_id",
-                "limit": 1,
+                "primary_email": f"in.({','.join(emails)})",
+                "select": "primary_email,entity_id",
             },
-            timeout=20.0,
+            timeout=30.0,
         )
         if response.status_code >= 400:
             raise RuntimeError(
-                f"Supabase entity lookup for indexing failed ({response.status_code}): {response.text}"
+                f"Supabase entity bulk lookup for indexing failed ({response.status_code}): {response.text}"
             )
-        rows = response.json()
-        if not rows:
-            return None
-        return str(rows[0]["entity_id"])
+        return {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
 
     def apply_hybrid_signals(self, signals: list[HybridSignal]) -> SearchIndexPersistResult:
         if not signals:
             return SearchIndexPersistResult(0, 0)
+
+        from collections import defaultdict
+        by_tenant: dict[str, list[HybridSignal]] = defaultdict(list)
+        for s in signals:
+            by_tenant[s.tenant_id].append(s)
+
         applied = 0
         skipped = 0
-        for signal in signals:
-            if not signal.primary_email:
-                skipped += 1
+
+        for tenant_id, tenant_signals in by_tenant.items():
+            valid = [s for s in tenant_signals if s.primary_email]
+            skipped += len(tenant_signals) - len(valid)
+            if not valid:
                 continue
-            entity_id = self._resolve_entity_id(signal.tenant_id, signal.primary_email)
-            if not entity_id:
-                skipped += 1
+
+            # ── 1. Bulk-resolve entity IDs (1 GET per tenant) ─────────────────
+            emails = list({s.primary_email for s in valid})
+            email_to_id = self._bulk_resolve_entity_ids(tenant_id, emails)
+
+            entity_ids = list(email_to_id.values())
+            if not entity_ids:
+                skipped += len(valid)
                 continue
-            read = httpx.get(
+
+            # ── 2. Bulk-fetch all matching search_documents (1 GET per tenant) ──
+            doc_resp = httpx.get(
                 self._url("search_documents"),
                 headers=self._base_headers,
                 params={
-                    "tenant_id": f"eq.{signal.tenant_id}",
-                    "entity_id": f"eq.{entity_id}",
-                    "doc_type": f"eq.{signal.doc_type}",
-                    "content": f"eq.{signal.content}",
-                    "select": "id,metadata_json",
-                    "limit": 1,
+                    "tenant_id": f"eq.{tenant_id}",
+                    "entity_id": f"in.({','.join(entity_ids)})",
+                    "select": "id,entity_id,doc_type,content,metadata_json",
                 },
-                timeout=20.0,
+                timeout=30.0,
             )
-            if read.status_code >= 400:
+            if doc_resp.status_code >= 400:
                 raise RuntimeError(
-                    f"Supabase search_documents lookup failed ({read.status_code}): {read.text}"
+                    f"Supabase search_documents bulk fetch failed ({doc_resp.status_code}): {doc_resp.text}"
                 )
-            rows = read.json()
-            if not rows:
-                skipped += 1
-                continue
-            row = rows[0]
-            metadata = dict(row.get("metadata_json") or {})
-            metadata["hybrid_keywords"] = signal.keywords
-            metadata["embedding_ready"] = signal.embedding_ready
-            metadata["indexed"] = True
-            patch = httpx.patch(
-                self._url("search_documents"),
-                headers=self._base_headers,
-                params={"id": f"eq.{row['id']}"},
-                json={"metadata_json": metadata},
-                timeout=20.0,
-            )
-            if patch.status_code >= 400:
-                raise RuntimeError(
-                    f"Supabase search_documents index patch failed ({patch.status_code}): {patch.text}"
+            # Build lookup: (entity_id, doc_type, content) -> row
+            doc_by_key: dict[tuple[str, str, str], dict] = {}
+            for row in doc_resp.json():
+                key = (str(row["entity_id"]), str(row["doc_type"]), str(row["content"]))
+                doc_by_key[key] = row
+
+            # ── 3. PATCH metadata on each matched doc (unavoidable: per-doc keywords) ─
+            for signal in valid:
+                entity_id = email_to_id.get(signal.primary_email)
+                if not entity_id:
+                    skipped += 1
+                    continue
+                key = (entity_id, signal.doc_type, signal.content)
+                row = doc_by_key.get(key)
+                if not row:
+                    skipped += 1
+                    continue
+                metadata = dict(row.get("metadata_json") or {})
+                metadata["hybrid_keywords"] = signal.keywords
+                metadata["embedding_ready"] = signal.embedding_ready
+                metadata["indexed"] = True
+                patch = httpx.patch(
+                    self._url("search_documents"),
+                    headers=self._base_headers,
+                    params={"id": f"eq.{row['id']}"},
+                    json={"metadata_json": metadata},
+                    timeout=20.0,
                 )
-            applied += 1
+                if patch.status_code >= 400:
+                    raise RuntimeError(
+                        f"Supabase search_documents index patch failed ({patch.status_code}): {patch.text}"
+                    )
+                applied += 1
+
         return SearchIndexPersistResult(applied, skipped)
 
     def health_check(self, tenant_id: str) -> dict[str, Any]:
-        read = httpx.get(
+        # Use Prefer:count=exact with limit=0 to get counts without fetching rows.
+        # PostgREST returns total in the Content-Range header as "*/N".
+        count_headers = {**self._base_headers, "Prefer": "count=exact"}
+
+        # Total documents count
+        total_resp = httpx.get(
             self._url("search_documents"),
-            headers=self._base_headers,
-            params={"tenant_id": f"eq.{tenant_id}", "select": "metadata_json"},
+            headers=count_headers,
+            params={"tenant_id": f"eq.{tenant_id}", "select": "id", "limit": "0"},
             timeout=20.0,
         )
-        if read.status_code >= 400:
+        if total_resp.status_code not in (200, 206):
             raise RuntimeError(
-                f"Supabase search_documents health read failed ({read.status_code}): {read.text}"
+                f"Supabase search_documents health count failed ({total_resp.status_code}): {total_resp.text}"
             )
-        rows = read.json()
-        total_docs = len(rows)
-        indexed_docs = 0
-        for row in rows:
-            metadata = dict(row.get("metadata_json") or {})
-            if metadata.get("indexed") is True:
-                indexed_docs += 1
+        content_range = total_resp.headers.get("Content-Range", "*/0")
+        total_docs = int(content_range.split("/")[-1] or "0")
+
+        # Indexed documents count (metadata_json->>'indexed' = 'true')
+        indexed_resp = httpx.get(
+            self._url("search_documents"),
+            headers=count_headers,
+            params={
+                "tenant_id": f"eq.{tenant_id}",
+                "metadata_json->>indexed": "eq.true",
+                "select": "id",
+                "limit": "0",
+            },
+            timeout=20.0,
+        )
+        if indexed_resp.status_code not in (200, 206):
+            raise RuntimeError(
+                f"Supabase search_documents indexed count failed ({indexed_resp.status_code}): {indexed_resp.text}"
+            )
+        indexed_range = indexed_resp.headers.get("Content-Range", "*/0")
+        indexed_docs = int(indexed_range.split("/")[-1] or "0")
+
         return {
             "tenant_id": tenant_id,
             "total_docs": total_docs,
