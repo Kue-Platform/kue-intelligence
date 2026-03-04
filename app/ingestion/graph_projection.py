@@ -47,13 +47,16 @@ class GraphProjectionService:
     def _url(self, table: str) -> str:
         return f"{self.settings.supabase_url.rstrip('/')}/rest/v1/{table}"
 
-    def _headers(self, prefer_repr: bool = False) -> dict[str, str]:
+    def _headers(self, prefer_repr: bool = False, upsert: bool = False) -> dict[str, str]:
         headers = {
             "apikey": self._api_key,
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
-        if prefer_repr:
+        if upsert:
+            # PostgREST requires this header to treat on_conflict as an upsert
+            headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+        elif prefer_repr:
             headers["Prefer"] = "return=representation"
         return headers
 
@@ -442,7 +445,7 @@ class GraphProjectionService:
 
         run_resp = httpx.post(
             self._url("graph_projection_runs"),
-            headers=self._headers(prefer_repr=True),
+            headers=self._headers(upsert=True),
             params={"on_conflict": "run_id"},
             json=[run_payload],
             timeout=30.0,
@@ -521,7 +524,7 @@ class GraphProjectionService:
         if node_rows:
             node_resp = httpx.post(
                 self._url("graph_projection_nodes"),
-                headers=self._headers(prefer_repr=False),
+                headers=self._headers(upsert=True),
                 params={"on_conflict": "tenant_id,node_label,node_key"},
                 json=node_rows,
                 timeout=30.0,
@@ -541,7 +544,7 @@ class GraphProjectionService:
         if edge_rows:
             edge_resp = httpx.post(
                 self._url("graph_projection_edges"),
-                headers=self._headers(prefer_repr=False),
+                headers=self._headers(upsert=True),
                 params={"on_conflict": "tenant_id,edge_type,edge_key"},
                 json=edge_rows,
                 timeout=30.0,
