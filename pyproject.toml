@@ -7,7 +7,7 @@ name = "kue-intelligence"
 version = "0.1.0"
 description = "FastAPI staged ingestion service scaffold"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115.0,<1.0.0",
   "uvicorn[standard]>=0.30.0,<1.0.0",
