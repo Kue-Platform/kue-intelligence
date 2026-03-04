@@ -110,14 +110,26 @@ class Neo4jGraphStore(GraphStore):
 
     def ensure_schema(self) -> dict[str, Any]:
         queries = [
+            # Node uniqueness constraints (back MERGE statements)
             "CREATE CONSTRAINT person_entity_id IF NOT EXISTS FOR (p:Person) REQUIRE (p.tenant_id, p.entity_id) IS UNIQUE",
             "CREATE CONSTRAINT user_user_id IF NOT EXISTS FOR (u:User) REQUIRE (u.tenant_id, u.user_id) IS UNIQUE",
             "CREATE CONSTRAINT company_company_id IF NOT EXISTS FOR (c:Company) REQUIRE (c.tenant_id, c.company_id) IS UNIQUE",
             "CREATE CONSTRAINT topic_topic_id IF NOT EXISTS FOR (t:Topic) REQUIRE (t.tenant_id, t.topic_id) IS UNIQUE",
+            # Node property indexes
             "CREATE INDEX person_primary_email IF NOT EXISTS FOR (p:Person) ON (p.primary_email)",
             "CREATE INDEX person_domain IF NOT EXISTS FOR (p:Person) ON (p.domain)",
             "CREATE INDEX company_domain IF NOT EXISTS FOR (c:Company) ON (c.domain)",
             "CREATE INDEX topic_name IF NOT EXISTS FOR (t:Topic) ON (t.name)",
+            # Relationship property indexes on tenant_id
+            # Allows WHERE r.tenant_id = $x to use an index instead of full scan
+            "CREATE INDEX rel_knows_tenant IF NOT EXISTS FOR ()-[r:KNOWS]-() ON (r.tenant_id)",
+            "CREATE INDEX rel_interacted_tenant IF NOT EXISTS FOR ()-[r:INTERACTED_WITH]-() ON (r.tenant_id)",
+            "CREATE INDEX rel_works_at_tenant IF NOT EXISTS FOR ()-[r:WORKS_AT]-() ON (r.tenant_id)",
+            "CREATE INDEX rel_member_of_tenant IF NOT EXISTS FOR ()-[r:MEMBER_OF]-() ON (r.tenant_id)",
+            "CREATE INDEX rel_has_topic_tenant IF NOT EXISTS FOR ()-[r:HAS_TOPIC]-() ON (r.tenant_id)",
+            "CREATE INDEX rel_intro_path_tenant IF NOT EXISTS FOR ()-[r:INTRO_PATH]-() ON (r.tenant_id)",
+            # source_event_id index for INTERACTED_WITH dedup via MERGE
+            "CREATE INDEX rel_interacted_source IF NOT EXISTS FOR ()-[r:INTERACTED_WITH]-() ON (r.source_event_id)",
         ]
         with self._driver.session(database=self._database) as session:
             for query in queries:
@@ -214,13 +226,10 @@ class Neo4jGraphStore(GraphStore):
         UNWIND $rows AS row
         MATCH (a:Person {tenant_id: row.tenant_id, entity_id: row.actor_entity_id})
         MATCH (b:Person {tenant_id: row.tenant_id, entity_id: row.target_entity_id})
-        MERGE (a)-[r:INTERACTED_WITH {
-            tenant_id: row.tenant_id,
-            source_event_id: row.source_event_id,
-            channel: row.channel,
-            occurred_at: row.occurred_at
-        }]->(b)
-        SET r.interaction_type = row.interaction_type
+        MERGE (a)-[r:INTERACTED_WITH {tenant_id: row.tenant_id, source_event_id: row.source_event_id}]->(b)
+        SET r.channel = row.channel,
+            r.interaction_type = row.interaction_type,
+            r.occurred_at = row.occurred_at
         RETURN count(*) AS affected
         """
 
@@ -301,9 +310,8 @@ class Neo4jGraphStore(GraphStore):
         )
         rel_counts = self._run_query(
             """
-            MATCH ()-[r]->()
+            MATCH ()-[r:KNOWS|INTERACTED_WITH|WORKS_AT|MEMBER_OF|HAS_TOPIC|INTRO_PATH]->()
             WHERE r.tenant_id = $tenant_id
-              AND type(r) IN ['KNOWS','INTERACTED_WITH','WORKS_AT','MEMBER_OF','HAS_TOPIC','INTRO_PATH']
             RETURN type(r) AS rel_type, count(r) AS cnt
             """,
             tenant_id=tenant_id,
