@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     inngest_max_retries: int = 5
     alert_webhook_url: str = ""
     admin_reset_token: str = ""
+    neo4j_uri: str = ""
+    neo4j_username: str = ""
+    neo4j_password: str = ""
+    neo4j_database: str = "neo4j"
+    graph_projection_batch_size: int = 500
 
     model_config = SettingsConfigDict(
         env_file=".env",

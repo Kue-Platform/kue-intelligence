@@ -13,8 +13,25 @@ from app.ingestion.canonical_store import create_canonical_event_store
 from app.ingestion.enrichment import clean_and_enrich_events
 from app.ingestion.entity_resolution import extract_entity_candidates, merge_entity_candidates
 from app.ingestion.entity_store import create_entity_store
+from app.ingestion.graph_projection import create_graph_projection_service
+from app.ingestion.graph_store import create_graph_store
+from app.ingestion.metadata_extraction import extract_metadata_candidates
 from app.ingestion.relationship_extraction import compute_relationship_strength, extract_interactions
 from app.ingestion.relationship_store import create_relationship_store
+from app.ingestion.semantic_prep import build_semantic_documents
+from app.ingestion.search_document_store import create_search_document_store
+from app.ingestion.embeddings import (
+    EmbeddingRequest,
+    EmbeddingVectorRecord,
+    build_embedding_requests,
+    embedding_cache_lookup,
+    embedding_cache_store,
+    generate_embeddings,
+)
+from app.ingestion.embedding_store import create_embedding_store
+from app.ingestion.cache_registry import cache_registry
+from app.ingestion.search_indexing import build_hybrid_signals
+from app.ingestion.search_index_store import create_search_index_store
 from app.ingestion.google_connector import GoogleOAuthConnector, GoogleOAuthContext
 from app.ingestion.parsers import parse_raw_events
 from app.ingestion.pipeline_store import PipelineStore, create_pipeline_store
@@ -264,6 +281,213 @@ def _persist_relationships(
     }
 
 
+def _persist_metadata(metadata_payload: dict[str, Any]) -> dict[str, Any]:
+    from app.ingestion.metadata_extraction import MetadataCandidate
+
+    candidates = [
+        MetadataCandidate.model_validate(item)
+        for item in list(metadata_payload.get("candidates", []))
+    ]
+    store = create_entity_store(settings)
+    updated_count = store.upsert_metadata(candidates)
+    return {
+        "candidate_count": len(candidates),
+        "updated_count": updated_count,
+        "store": store.store_name,
+    }
+
+
+def _persist_semantic_documents(semantic_payload: dict[str, Any]) -> dict[str, Any]:
+    from app.ingestion.semantic_prep import SemanticDocument
+
+    docs = [
+        SemanticDocument.model_validate(item)
+        for item in list(semantic_payload.get("documents", []))
+    ]
+    store = create_search_document_store(settings)
+    result = store.persist_documents(docs)
+    return {
+        "candidate_count": result.candidate_count,
+        "stored_count": result.stored_count,
+        "skipped_no_entity": result.skipped_no_entity,
+        "store": store.store_name,
+    }
+
+
+def _embedding_cache_lookup(semantic_payload: dict[str, Any]) -> dict[str, Any]:
+    requests = build_embedding_requests(semantic_payload)
+    lookup = embedding_cache_lookup(requests)
+    return lookup.model_dump(mode="json")
+
+
+def _generate_embedding_vectors(cache_lookup_payload: dict[str, Any]) -> dict[str, Any]:
+    misses = [
+        EmbeddingRequest.model_validate(item)
+        for item in list(cache_lookup_payload.get("misses", []))
+    ]
+    generated = generate_embeddings(misses)
+    hits = [
+        EmbeddingVectorRecord.model_validate(item)
+        for item in list(cache_lookup_payload.get("hits", []))
+    ]
+    all_records = hits + generated.generated
+    return {
+        "candidate_count": int(cache_lookup_payload.get("candidate_count", 0)),
+        "cache_hit_count": int(cache_lookup_payload.get("cache_hit_count", 0)),
+        "cache_miss_count": int(cache_lookup_payload.get("cache_miss_count", 0)),
+        "generated_count": generated.generated_count,
+        "records": [item.model_dump(mode="json") for item in all_records],
+    }
+
+
+def _embedding_cache_store(vectors_payload: dict[str, Any]) -> dict[str, Any]:
+    records = [
+        EmbeddingVectorRecord.model_validate(item)
+        for item in list(vectors_payload.get("records", []))
+    ]
+    stored = embedding_cache_store(records)
+    return {"cache_store_count": stored}
+
+
+def _persist_embeddings(vectors_payload: dict[str, Any]) -> dict[str, Any]:
+    records = [
+        EmbeddingVectorRecord.model_validate(item)
+        for item in list(vectors_payload.get("records", []))
+    ]
+    store = create_embedding_store(settings)
+    result = store.persist_vectors(records)
+    return {
+        "persisted_count": result.persisted_count,
+        "skipped_no_entity": result.skipped_no_entity,
+        "store": store.store_name,
+    }
+
+
+def _cache_enrichment(enrichment_payload: dict[str, Any]) -> dict[str, Any]:
+    parsed_events = list(enrichment_payload.get("parsed_events", []))
+    cached = 0
+    for event in parsed_events:
+        source_event_id = str(event.get("source_event_id") or "").strip()
+        tenant_id = str(event.get("tenant_id") or "").strip()
+        if not source_event_id or not tenant_id:
+            continue
+        key = f"{tenant_id}:{source_event_id}"
+        cache_registry.put(
+            namespace="enrichment",
+            version="v1",
+            key=key,
+            value=dict(event),
+        )
+        cached += 1
+    return {"cached_count": cached}
+
+
+def _cache_embeddings(vectors_payload: dict[str, Any]) -> dict[str, Any]:
+    records = list(vectors_payload.get("records", []))
+    cached = 0
+    for record in records:
+        tenant_id = str(record.get("tenant_id") or "").strip()
+        doc_type = str(record.get("doc_type") or "").strip()
+        content = str(record.get("content") or "").strip()
+        if not tenant_id or not doc_type or not content:
+            continue
+        key = f"{tenant_id}:{doc_type}:{content}"
+        cache_registry.put(
+            namespace="embedding",
+            version="v1",
+            key=key,
+            value={"embedding": list(record.get("embedding", []))},
+        )
+        cached += 1
+    return {"cached_count": cached}
+
+
+def _cache_metrics_snapshot() -> dict[str, Any]:
+    stats = cache_registry.stats()
+    return {"stats": stats}
+
+
+def _persist_search_index(signals_payload: dict[str, Any]) -> dict[str, Any]:
+    from app.ingestion.search_indexing import HybridSignal
+
+    signals = [
+        HybridSignal.model_validate(item)
+        for item in list(signals_payload.get("signals", []))
+    ]
+    store = create_search_index_store(settings)
+    result = store.apply_hybrid_signals(signals)
+    tenant_id = str(signals[0].tenant_id) if signals else ""
+    health = store.health_check(tenant_id) if tenant_id else {"index_ready": False}
+    return {
+        "applied_count": result.applied_count,
+        "skipped_no_entity": result.skipped_no_entity,
+        "health": health,
+        "store": store.store_name,
+    }
+
+
+def _graph_prepare(tenant_id: str, user_id: str, trace_id: str) -> dict[str, Any]:
+    graph_store = create_graph_store(settings)
+    schema_result = graph_store.ensure_schema()
+    service = create_graph_projection_service(settings)
+    snapshot = service.prepare_snapshot(tenant_id=tenant_id, user_id=user_id, trace_id=trace_id)
+    return {
+        "enabled": bool(snapshot.get("enabled", False)) and bool(schema_result.get("enabled", False)),
+        "schema": schema_result,
+        "batch_stats": snapshot.get("batch_stats", {}),
+        "snapshot": snapshot,
+        "snapshot_checksum": snapshot.get("snapshot_checksum"),
+        "store": graph_store.store_name,
+    }
+
+
+def _graph_project_nodes(prepare_result: dict[str, Any]) -> dict[str, Any]:
+    snapshot = dict(prepare_result.get("snapshot", {}))
+    graph_store = create_graph_store(settings)
+    result = graph_store.upsert_nodes(snapshot)
+    result["store"] = graph_store.store_name
+    return result
+
+
+def _graph_project_edges(prepare_result: dict[str, Any]) -> dict[str, Any]:
+    snapshot = dict(prepare_result.get("snapshot", {}))
+    graph_store = create_graph_store(settings)
+    result = graph_store.upsert_edges(snapshot)
+    result["store"] = graph_store.store_name
+    return result
+
+
+def _graph_finalize(
+    run_id: str,
+    trace_id: str,
+    tenant_id: str,
+    user_id: str,
+    prepare_result: dict[str, Any],
+    node_result: dict[str, Any],
+    edge_result: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot = dict(prepare_result.get("snapshot", {}))
+    graph_store = create_graph_store(settings)
+    verification = graph_store.verify(snapshot)
+    service = create_graph_projection_service(settings)
+    mirror = service.persist_mirror_state(
+        run_id=run_id,
+        trace_id=trace_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        snapshot=snapshot,
+        verification=verification,
+        node_result=node_result,
+        edge_result=edge_result,
+    )
+    return {
+        "verification": verification,
+        "mirror": mirror,
+        "store": graph_store.store_name,
+        "snapshot_checksum": prepare_result.get("snapshot_checksum"),
+    }
+
+
 def _resolve_source_hint(data: dict[str, Any], source_events_payload: list[dict[str, Any]]) -> IngestionSource | None:
     if source_events_payload:
         first_source = source_events_payload[0].get("source")
@@ -355,6 +579,52 @@ def _run_layer_internal(
             result = _persist_relationships(
                 dict(payload["extract_result"]),
                 dict(payload["strength_result"]),
+            )
+        elif op == "extract_metadata":
+            result = extract_metadata_candidates(dict(payload["enrichment_result"])).model_dump(mode="json")
+        elif op == "persist_metadata":
+            result = _persist_metadata(dict(payload["metadata_result"]))
+        elif op == "build_semantic_documents":
+            result = build_semantic_documents(dict(payload["enrichment_result"])).model_dump(mode="json")
+        elif op == "persist_semantic_documents":
+            result = _persist_semantic_documents(dict(payload["semantic_result"]))
+        elif op == "embedding_cache_lookup":
+            result = _embedding_cache_lookup(dict(payload["semantic_result"]))
+        elif op == "embedding_generate":
+            result = _generate_embedding_vectors(dict(payload["cache_lookup_result"]))
+        elif op == "embedding_cache_store":
+            result = _embedding_cache_store(dict(payload["vectors_result"]))
+        elif op == "embedding_persist":
+            result = _persist_embeddings(dict(payload["vectors_result"]))
+        elif op == "cache_enrichment":
+            result = _cache_enrichment(dict(payload["enrichment_result"]))
+        elif op == "cache_embeddings":
+            result = _cache_embeddings(dict(payload["vectors_result"]))
+        elif op == "cache_metrics_snapshot":
+            result = _cache_metrics_snapshot()
+        elif op == "build_hybrid_signals":
+            result = build_hybrid_signals(dict(payload["vectors_result"])).model_dump(mode="json")
+        elif op == "persist_search_index":
+            result = _persist_search_index(dict(payload["signals_result"]))
+        elif op == "graph_prepare":
+            result = _graph_prepare(
+                str(payload["tenant_id"]),
+                str(payload["user_id"]),
+                str(payload["trace_id"]),
+            )
+        elif op == "graph_project_nodes":
+            result = _graph_project_nodes(dict(payload["prepare_result"]))
+        elif op == "graph_project_edges":
+            result = _graph_project_edges(dict(payload["prepare_result"]))
+        elif op == "graph_finalize":
+            result = _graph_finalize(
+                str(payload["run_id"]),
+                str(payload["trace_id"]),
+                str(payload["tenant_id"]),
+                str(payload["user_id"]),
+                dict(payload["prepare_result"]),
+                dict(payload["node_result"]),
+                dict(payload["edge_result"]),
             )
         elif op == "persist_canonical":
             result = _persist_canonical(
@@ -537,6 +807,225 @@ def _layer_persist_relationships(
     )
 
 
+def _layer_extract_metadata(run_id: str, enrichment_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="metadata_extraction",
+        layer_key="extract_tags",
+        records_in=int(enrichment_result.get("enriched_count", 0)),
+        op="extract_metadata",
+        payload={"enrichment_result": enrichment_result},
+    )
+
+
+def _layer_persist_metadata(run_id: str, metadata_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="metadata_extraction",
+        layer_key="persist_metadata",
+        records_in=int(metadata_result.get("candidate_count", 0)),
+        op="persist_metadata",
+        payload={"metadata_result": metadata_result},
+    )
+
+
+def _layer_build_semantic_documents(run_id: str, enrichment_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="semantic_prep",
+        layer_key="build_search_documents",
+        records_in=int(enrichment_result.get("enriched_count", 0)),
+        op="build_semantic_documents",
+        payload={"enrichment_result": enrichment_result},
+    )
+
+
+def _layer_persist_semantic_documents(run_id: str, semantic_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="semantic_prep",
+        layer_key="persist_search_documents",
+        records_in=int(semantic_result.get("document_count", 0)),
+        op="persist_semantic_documents",
+        payload={"semantic_result": semantic_result},
+    )
+
+
+def _layer_embedding_cache_lookup(run_id: str, semantic_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="embedding",
+        layer_key="cache_lookup",
+        records_in=int(semantic_result.get("document_count", 0)),
+        op="embedding_cache_lookup",
+        payload={"semantic_result": semantic_result},
+    )
+
+
+def _layer_embedding_generate(run_id: str, cache_lookup_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="embedding",
+        layer_key="generate_vectors",
+        records_in=int(cache_lookup_result.get("cache_miss_count", 0)),
+        op="embedding_generate",
+        payload={"cache_lookup_result": cache_lookup_result},
+    )
+
+
+def _layer_embedding_cache_store(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="embedding",
+        layer_key="cache_store",
+        records_in=int(vectors_result.get("generated_count", 0)),
+        op="embedding_cache_store",
+        payload={"vectors_result": vectors_result},
+    )
+
+
+def _layer_embedding_persist(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="embedding",
+        layer_key="persist_vectors",
+        records_in=int(vectors_result.get("candidate_count", 0)),
+        op="embedding_persist",
+        payload={"vectors_result": vectors_result},
+    )
+
+
+def _layer_cache_enrichment(run_id: str, enrichment_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="caching",
+        layer_key="write_enrichment_cache",
+        records_in=int(enrichment_result.get("enriched_count", 0)),
+        op="cache_enrichment",
+        payload={"enrichment_result": enrichment_result},
+    )
+
+
+def _layer_cache_embeddings(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="caching",
+        layer_key="write_embedding_cache",
+        records_in=int(vectors_result.get("candidate_count", 0)),
+        op="cache_embeddings",
+        payload={"vectors_result": vectors_result},
+    )
+
+
+def _layer_cache_metrics(run_id: str) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="caching",
+        layer_key="cache_metrics_snapshot",
+        records_in=None,
+        op="cache_metrics_snapshot",
+        payload={},
+    )
+
+
+def _layer_build_hybrid_signals(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="search_indexing",
+        layer_key="materialize_hybrid_signals",
+        records_in=int(vectors_result.get("candidate_count", 0)),
+        op="build_hybrid_signals",
+        payload={"vectors_result": vectors_result},
+    )
+
+
+def _layer_persist_search_index(run_id: str, signals_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="search_indexing",
+        layer_key="index_health_check",
+        records_in=int(signals_result.get("signal_count", 0)),
+        op="persist_search_index",
+        payload={"signals_result": signals_result},
+    )
+
+
+def _layer_graph_prepare(run_id: str, tenant_id: str, user_id: str, trace_id: str) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="graph_projection",
+        layer_key="prepare",
+        records_in=None,
+        op="graph_prepare",
+        payload={"tenant_id": tenant_id, "user_id": user_id, "trace_id": trace_id},
+    )
+
+
+def _layer_graph_project_nodes(run_id: str, prepare_result: dict[str, Any]) -> dict[str, Any]:
+    snapshot = dict(prepare_result.get("snapshot", {}))
+    records_in = (
+        len(list(snapshot.get("persons", [])))
+        + len(list(snapshot.get("users", [])))
+        + len(list(snapshot.get("companies", [])))
+        + len(list(snapshot.get("topics", [])))
+    )
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="graph_projection",
+        layer_key="project_nodes",
+        records_in=records_in,
+        op="graph_project_nodes",
+        payload={"prepare_result": prepare_result},
+    )
+
+
+def _layer_graph_project_edges(run_id: str, prepare_result: dict[str, Any]) -> dict[str, Any]:
+    snapshot = dict(prepare_result.get("snapshot", {}))
+    records_in = (
+        len(list(snapshot.get("knows_edges", [])))
+        + len(list(snapshot.get("interacted_edges", [])))
+        + len(list(snapshot.get("works_at_edges", [])))
+        + len(list(snapshot.get("member_of_edges", [])))
+        + len(list(snapshot.get("has_topic_edges", [])))
+        + len(list(snapshot.get("intro_path_edges", [])))
+    )
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="graph_projection",
+        layer_key="project_edges",
+        records_in=records_in,
+        op="graph_project_edges",
+        payload={"prepare_result": prepare_result},
+    )
+
+
+def _layer_graph_finalize(
+    run_id: str,
+    trace_id: str,
+    tenant_id: str,
+    user_id: str,
+    prepare_result: dict[str, Any],
+    node_result: dict[str, Any],
+    edge_result: dict[str, Any],
+) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="graph_projection",
+        layer_key="finalize",
+        records_in=None,
+        op="graph_finalize",
+        payload={
+            "run_id": run_id,
+            "trace_id": trace_id,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "prepare_result": prepare_result,
+            "node_result": node_result,
+            "edge_result": edge_result,
+        },
+    )
+
+
 def _mark_run_succeeded(run_id: str, metadata: dict[str, Any]) -> None:
     store = _pipeline_store()
     store.mark_pipeline_status(run_id=run_id, status="succeeded", metadata=metadata)
@@ -568,6 +1057,10 @@ async def _run_pipeline_core(
     )
     run_id = str(run_info["run_id"])
     trace_id = str(run_info["trace_id"])
+    tenant_id = str(run_info["tenant_id"])
+    user_id = str(run_info["user_id"])
+    tenant_id = str(run_info["tenant_id"])
+    user_id = str(run_info["user_id"])
     try:
         await ctx.step.run(
             "stage.raw_capture.layer.validate",
@@ -631,6 +1124,83 @@ async def _run_pipeline_core(
             run_id,
             entity_merge,
         )
+        metadata_result = await ctx.step.run(
+            "stage.metadata_extraction.layer.extract_tags",
+            _layer_extract_metadata,
+            run_id,
+            enrichment_result,
+        )
+        metadata_persist = await ctx.step.run(
+            "stage.metadata_extraction.layer.persist_metadata",
+            _layer_persist_metadata,
+            run_id,
+            metadata_result,
+        )
+        semantic_result = await ctx.step.run(
+            "stage.semantic_prep.layer.build_search_documents",
+            _layer_build_semantic_documents,
+            run_id,
+            enrichment_result,
+        )
+        semantic_persist = await ctx.step.run(
+            "stage.semantic_prep.layer.persist_search_documents",
+            _layer_persist_semantic_documents,
+            run_id,
+            semantic_result,
+        )
+        embedding_lookup = await ctx.step.run(
+            "stage.embedding.layer.cache_lookup",
+            _layer_embedding_cache_lookup,
+            run_id,
+            semantic_result,
+        )
+        embedding_vectors = await ctx.step.run(
+            "stage.embedding.layer.generate_vectors",
+            _layer_embedding_generate,
+            run_id,
+            embedding_lookup,
+        )
+        embedding_cache_written = await ctx.step.run(
+            "stage.embedding.layer.cache_store",
+            _layer_embedding_cache_store,
+            run_id,
+            embedding_vectors,
+        )
+        embedding_persist = await ctx.step.run(
+            "stage.embedding.layer.persist_vectors",
+            _layer_embedding_persist,
+            run_id,
+            embedding_vectors,
+        )
+        caching_enrichment = await ctx.step.run(
+            "stage.caching.layer.write_enrichment_cache",
+            _layer_cache_enrichment,
+            run_id,
+            enrichment_result,
+        )
+        caching_embeddings = await ctx.step.run(
+            "stage.caching.layer.write_embedding_cache",
+            _layer_cache_embeddings,
+            run_id,
+            embedding_vectors,
+        )
+        caching_metrics = await ctx.step.run(
+            "stage.caching.layer.cache_metrics_snapshot",
+            _layer_cache_metrics,
+            run_id,
+        )
+        hybrid_signals = await ctx.step.run(
+            "stage.search_indexing.layer.materialize_hybrid_signals",
+            _layer_build_hybrid_signals,
+            run_id,
+            embedding_vectors,
+        )
+        search_index_result = await ctx.step.run(
+            "stage.search_indexing.layer.index_health_check",
+            _layer_persist_search_index,
+            run_id,
+            hybrid_signals,
+        )
         interactions = await ctx.step.run(
             "stage.relationship_extraction.layer.extract_interactions",
             _layer_extract_interactions,
@@ -649,6 +1219,37 @@ async def _run_pipeline_core(
             run_id,
             interactions,
             strengths,
+        )
+        graph_prepare = await ctx.step.run(
+            "stage.graph_projection.layer.prepare",
+            _layer_graph_prepare,
+            run_id,
+            tenant_id,
+            user_id,
+            trace_id,
+        )
+        graph_nodes = await ctx.step.run(
+            "stage.graph_projection.layer.project_nodes",
+            _layer_graph_project_nodes,
+            run_id,
+            graph_prepare,
+        )
+        graph_edges = await ctx.step.run(
+            "stage.graph_projection.layer.project_edges",
+            _layer_graph_project_edges,
+            run_id,
+            graph_prepare,
+        )
+        graph_finalize = await ctx.step.run(
+            "stage.graph_projection.layer.finalize",
+            _layer_graph_finalize,
+            run_id,
+            trace_id,
+            tenant_id,
+            user_id,
+            graph_prepare,
+            graph_nodes,
+            graph_edges,
         )
         summary = {
             "trace_id": trace_id,
@@ -674,10 +1275,42 @@ async def _run_pipeline_core(
                 "resolved_count": entity_merge.get("resolved_count", 0),
                 **entity_persist,
             },
+            "metadata_extraction": {
+                **metadata_persist,
+            },
+            "semantic_prep": {
+                "document_count": semantic_result.get("document_count", 0),
+                **semantic_persist,
+            },
+            "embedding": {
+                "cache_hit_count": embedding_lookup.get("cache_hit_count", 0),
+                "cache_miss_count": embedding_lookup.get("cache_miss_count", 0),
+                "generated_count": embedding_vectors.get("generated_count", 0),
+                **embedding_cache_written,
+                **embedding_persist,
+            },
+            "caching": {
+                "enrichment_cached_count": caching_enrichment.get("cached_count", 0),
+                "embedding_cached_count": caching_embeddings.get("cached_count", 0),
+                **caching_metrics,
+            },
+            "search_indexing": {
+                "signal_count": hybrid_signals.get("signal_count", 0),
+                **search_index_result,
+            },
             "relationship_extraction": {
                 "interaction_count": interactions.get("interaction_count", 0),
                 "relationship_count": strengths.get("relationship_count", 0),
                 **relationship_persist,
+            },
+            "graph_projection": {
+                "batch_stats": graph_prepare.get("batch_stats", {}),
+                "nodes_by_label": graph_nodes.get("nodes_by_label", {}),
+                "edges_by_type": graph_edges.get("edges_by_type", {}),
+                "verification": graph_finalize.get("verification", {}),
+                "mirror": graph_finalize.get("mirror", {}),
+                "snapshot_checksum": graph_finalize.get("snapshot_checksum"),
+                "store": graph_finalize.get("store"),
             },
         }
         await ctx.step.run("stage.orchestration.layer.complete_run", _mark_run_succeeded, run_id, summary)
@@ -817,6 +1450,83 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             run_id,
             entity_merge,
         )
+        metadata_result = await ctx.step.run(
+            "stage.metadata_extraction.layer.extract_tags",
+            _layer_extract_metadata,
+            run_id,
+            enrichment_result,
+        )
+        metadata_persist = await ctx.step.run(
+            "stage.metadata_extraction.layer.persist_metadata",
+            _layer_persist_metadata,
+            run_id,
+            metadata_result,
+        )
+        semantic_result = await ctx.step.run(
+            "stage.semantic_prep.layer.build_search_documents",
+            _layer_build_semantic_documents,
+            run_id,
+            enrichment_result,
+        )
+        semantic_persist = await ctx.step.run(
+            "stage.semantic_prep.layer.persist_search_documents",
+            _layer_persist_semantic_documents,
+            run_id,
+            semantic_result,
+        )
+        embedding_lookup = await ctx.step.run(
+            "stage.embedding.layer.cache_lookup",
+            _layer_embedding_cache_lookup,
+            run_id,
+            semantic_result,
+        )
+        embedding_vectors = await ctx.step.run(
+            "stage.embedding.layer.generate_vectors",
+            _layer_embedding_generate,
+            run_id,
+            embedding_lookup,
+        )
+        embedding_cache_written = await ctx.step.run(
+            "stage.embedding.layer.cache_store",
+            _layer_embedding_cache_store,
+            run_id,
+            embedding_vectors,
+        )
+        embedding_persist = await ctx.step.run(
+            "stage.embedding.layer.persist_vectors",
+            _layer_embedding_persist,
+            run_id,
+            embedding_vectors,
+        )
+        caching_enrichment = await ctx.step.run(
+            "stage.caching.layer.write_enrichment_cache",
+            _layer_cache_enrichment,
+            run_id,
+            enrichment_result,
+        )
+        caching_embeddings = await ctx.step.run(
+            "stage.caching.layer.write_embedding_cache",
+            _layer_cache_embeddings,
+            run_id,
+            embedding_vectors,
+        )
+        caching_metrics = await ctx.step.run(
+            "stage.caching.layer.cache_metrics_snapshot",
+            _layer_cache_metrics,
+            run_id,
+        )
+        hybrid_signals = await ctx.step.run(
+            "stage.search_indexing.layer.materialize_hybrid_signals",
+            _layer_build_hybrid_signals,
+            run_id,
+            embedding_vectors,
+        )
+        search_index_result = await ctx.step.run(
+            "stage.search_indexing.layer.index_health_check",
+            _layer_persist_search_index,
+            run_id,
+            hybrid_signals,
+        )
         interactions = await ctx.step.run(
             "stage.relationship_extraction.layer.extract_interactions",
             _layer_extract_interactions,
@@ -835,6 +1545,37 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             run_id,
             interactions,
             strengths,
+        )
+        graph_prepare = await ctx.step.run(
+            "stage.graph_projection.layer.prepare",
+            _layer_graph_prepare,
+            run_id,
+            tenant_id,
+            user_id,
+            trace_id,
+        )
+        graph_nodes = await ctx.step.run(
+            "stage.graph_projection.layer.project_nodes",
+            _layer_graph_project_nodes,
+            run_id,
+            graph_prepare,
+        )
+        graph_edges = await ctx.step.run(
+            "stage.graph_projection.layer.project_edges",
+            _layer_graph_project_edges,
+            run_id,
+            graph_prepare,
+        )
+        graph_finalize = await ctx.step.run(
+            "stage.graph_projection.layer.finalize",
+            _layer_graph_finalize,
+            run_id,
+            trace_id,
+            tenant_id,
+            user_id,
+            graph_prepare,
+            graph_nodes,
+            graph_edges,
         )
         summary = {
             "trace_id": trace_id,
@@ -855,10 +1596,42 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
                 "resolved_count": entity_merge.get("resolved_count", 0),
                 **entity_persist,
             },
+            "metadata_extraction": {
+                **metadata_persist,
+            },
+            "semantic_prep": {
+                "document_count": semantic_result.get("document_count", 0),
+                **semantic_persist,
+            },
+            "embedding": {
+                "cache_hit_count": embedding_lookup.get("cache_hit_count", 0),
+                "cache_miss_count": embedding_lookup.get("cache_miss_count", 0),
+                "generated_count": embedding_vectors.get("generated_count", 0),
+                **embedding_cache_written,
+                **embedding_persist,
+            },
+            "caching": {
+                "enrichment_cached_count": caching_enrichment.get("cached_count", 0),
+                "embedding_cached_count": caching_embeddings.get("cached_count", 0),
+                **caching_metrics,
+            },
+            "search_indexing": {
+                "signal_count": hybrid_signals.get("signal_count", 0),
+                **search_index_result,
+            },
             "relationship_extraction": {
                 "interaction_count": interactions.get("interaction_count", 0),
                 "relationship_count": strengths.get("relationship_count", 0),
                 **relationship_persist,
+            },
+            "graph_projection": {
+                "batch_stats": graph_prepare.get("batch_stats", {}),
+                "nodes_by_label": graph_nodes.get("nodes_by_label", {}),
+                "edges_by_type": graph_edges.get("edges_by_type", {}),
+                "verification": graph_finalize.get("verification", {}),
+                "mirror": graph_finalize.get("mirror", {}),
+                "snapshot_checksum": graph_finalize.get("snapshot_checksum"),
+                "store": graph_finalize.get("store"),
             },
             **canonical_result,
         }

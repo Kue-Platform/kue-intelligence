@@ -14,6 +14,7 @@ import httpx
 
 from app.core.config import Settings
 from app.ingestion.entity_resolution import EntityCandidate
+from app.ingestion.metadata_extraction import MetadataCandidate
 
 
 @dataclass
@@ -32,6 +33,10 @@ class EntityStore(ABC):
 
     @abstractmethod
     def upsert_entities(self, resolved_entities: list[EntityCandidate]) -> EntityPersistResult:
+        raise NotImplementedError
+
+    @abstractmethod
+    def upsert_metadata(self, metadata_candidates: list[MetadataCandidate]) -> int:
         raise NotImplementedError
 
 
@@ -219,6 +224,55 @@ class SqliteEntityStore(EntityStore):
                 conn.commit()
 
         return EntityPersistResult(len(resolved_entities), created, updated, identities)
+
+    def upsert_metadata(self, metadata_candidates: list[MetadataCandidate]) -> int:
+        if not metadata_candidates:
+            return 0
+        updated = 0
+        now = datetime.now(UTC).isoformat()
+        with self._lock:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                for item in metadata_candidates:
+                    row = conn.execute(
+                        """
+                        SELECT entity_id, metadata_json
+                        FROM entities
+                        WHERE tenant_id = ? AND primary_email = ?
+                        LIMIT 1
+                        """,
+                        (item.tenant_id, item.primary_email),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    try:
+                        existing_metadata = json.loads(str(row["metadata_json"] or "{}"))
+                    except json.JSONDecodeError:
+                        existing_metadata = {}
+                    merged_metadata = dict(existing_metadata)
+                    merged_metadata.update(item.metadata_json)
+                    conn.execute(
+                        """
+                        UPDATE entities
+                        SET display_name = coalesce(?, display_name),
+                            company_norm = coalesce(?, company_norm),
+                            title_norm = coalesce(?, title_norm),
+                            metadata_json = ?,
+                            updated_at = ?
+                        WHERE entity_id = ?
+                        """,
+                        (
+                            item.display_name,
+                            item.metadata_json.get("company_norm"),
+                            item.metadata_json.get("title_norm"),
+                            json.dumps(merged_metadata, ensure_ascii=True),
+                            now,
+                            str(row["entity_id"]),
+                        ),
+                    )
+                    updated += 1
+                conn.commit()
+        return updated
 
 
 class SupabaseEntityStore(EntityStore):
@@ -446,10 +500,54 @@ class SupabaseEntityStore(EntityStore):
 
         return EntityPersistResult(len(resolved_entities), total_created, total_updated, total_identities)
 
+    def upsert_metadata(self, metadata_candidates: list[MetadataCandidate]) -> int:
+        if not metadata_candidates:
+            return 0
+        updated = 0
+        for item in metadata_candidates:
+            lookup = httpx.get(
+                self._url("entities"),
+                headers=self._base_headers,
+                params={
+                    "tenant_id": f"eq.{item.tenant_id}",
+                    "primary_email": f"eq.{item.primary_email}",
+                    "select": "entity_id,metadata_json",
+                    "limit": 1,
+                },
+                timeout=20.0,
+            )
+            if lookup.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase entities metadata lookup failed ({lookup.status_code}): {lookup.text}"
+                )
+            rows = lookup.json()
+            if not rows:
+                continue
+            existing = rows[0]
+            merged_metadata = dict(existing.get("metadata_json") or {})
+            merged_metadata.update(item.metadata_json)
+            patch = httpx.patch(
+                self._url("entities"),
+                headers=self._base_headers,
+                params={"entity_id": f"eq.{existing['entity_id']}"},
+                json={
+                    "display_name": item.display_name,
+                    "company_norm": item.metadata_json.get("company_norm"),
+                    "title_norm": item.metadata_json.get("title_norm"),
+                    "metadata_json": merged_metadata,
+                },
+                timeout=20.0,
+            )
+            if patch.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase entities metadata update failed ({patch.status_code}): {patch.text}"
+                )
+            updated += 1
+        return updated
+
 
 def create_entity_store(settings: Settings) -> EntityStore:
     if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
         api_key = settings.supabase_service_role_key or settings.supabase_anon_key
         return SupabaseEntityStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqliteEntityStore(db_path=settings.pipeline_db_path)
-

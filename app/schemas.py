@@ -195,6 +195,50 @@ class Layer7RelationshipResponse(BaseModel):
     store: str
 
 
+class Layer8MetadataResponse(BaseModel):
+    trace_id: str
+    candidate_count: int
+    updated_count: int
+    store: str
+
+
+class Layer9SemanticResponse(BaseModel):
+    trace_id: str
+    document_count: int
+    stored_count: int
+    skipped_no_entity: int
+    store: str
+
+
+class Layer10EmbeddingResponse(BaseModel):
+    trace_id: str
+    candidate_count: int
+    cache_hit_count: int
+    cache_miss_count: int
+    generated_count: int
+    cache_store_count: int
+    persisted_count: int
+    skipped_no_entity: int
+    store: str
+
+
+class Layer11CacheResponse(BaseModel):
+    trace_id: str
+    enrichment_cached_count: int
+    embedding_cached_count: int
+    total_entries: int
+    namespaces: dict[str, int]
+
+
+class Layer12IndexResponse(BaseModel):
+    trace_id: str
+    signal_count: int
+    applied_count: int
+    skipped_no_entity: int
+    health: dict[str, Any]
+    store: str
+
+
 class PipelineRunResponse(BaseModel):
     run_id: str | None = None
     event_name: str

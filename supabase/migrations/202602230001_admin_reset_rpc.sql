@@ -10,6 +10,9 @@ as $$
 declare
   tables text[] := array[
     'ai_call_logs',
+    'graph_projection_edges',
+    'graph_projection_nodes',
+    'graph_projection_runs',
     'query_intents',
     'search_documents',
     'interaction_facts',

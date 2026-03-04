@@ -21,9 +21,22 @@ from app.ingestion.parsers import parse_raw_events
 from app.ingestion.enrichment import clean_and_enrich_events
 from app.ingestion.entity_resolution import extract_entity_candidates, merge_entity_candidates
 from app.ingestion.entity_store import EntityStore, create_entity_store
+from app.ingestion.metadata_extraction import extract_metadata_candidates
 from app.ingestion.admin_reset import reset_all_data
 from app.ingestion.relationship_extraction import compute_relationship_strength, extract_interactions
 from app.ingestion.relationship_store import RelationshipStore, create_relationship_store
+from app.ingestion.semantic_prep import build_semantic_documents
+from app.ingestion.search_document_store import SearchDocumentStore, create_search_document_store
+from app.ingestion.embeddings import (
+    build_embedding_requests,
+    embedding_cache_lookup,
+    embedding_cache_store,
+    generate_embeddings,
+)
+from app.ingestion.embedding_store import EmbeddingStore, create_embedding_store
+from app.ingestion.cache_registry import cache_registry
+from app.ingestion.search_indexing import build_hybrid_signals
+from app.ingestion.search_index_store import SearchIndexStore, create_search_index_store
 from app.ingestion.validators import validate_parsed_events
 from app.schemas import (
     CanonicalEventType,
@@ -41,6 +54,11 @@ from app.schemas import (
     Layer5EnrichmentResponse,
     Layer6EntityResolutionResponse,
     Layer7RelationshipResponse,
+    Layer8MetadataResponse,
+    Layer9SemanticResponse,
+    Layer10EmbeddingResponse,
+    Layer11CacheResponse,
+    Layer12IndexResponse,
     CanonicalParseFailure,
     Layer3PersistenceSummary,
     PipelineRunStatusResponse,
@@ -95,6 +113,33 @@ def _get_relationship_store() -> RelationshipStore:
 
 def get_relationship_store() -> RelationshipStore:
     return _get_relationship_store()
+
+
+@lru_cache(maxsize=1)
+def _get_search_document_store() -> SearchDocumentStore:
+    return create_search_document_store(settings)
+
+
+def get_search_document_store() -> SearchDocumentStore:
+    return _get_search_document_store()
+
+
+@lru_cache(maxsize=1)
+def _get_embedding_store() -> EmbeddingStore:
+    return create_embedding_store(settings)
+
+
+def get_embedding_store() -> EmbeddingStore:
+    return _get_embedding_store()
+
+
+@lru_cache(maxsize=1)
+def _get_search_index_store() -> SearchIndexStore:
+    return create_search_index_store(settings)
+
+
+def get_search_index_store() -> SearchIndexStore:
+    return _get_search_index_store()
 
 
 def _assert_admin_reset_token(token: str | None) -> None:
@@ -582,6 +627,283 @@ def relationship_layer7_by_trace(
         relationship_count=persist_result.relationship_count,
         relationships_upserted=persist_result.relationships_upserted,
         store=relationship_store.store_name,
+    )
+
+
+@router.post("/layer8/metadata/{trace_id}", response_model=Layer8MetadataResponse)
+def metadata_layer8_by_trace(
+    trace_id: str,
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    entity_store: EntityStore = Depends(get_entity_store),
+) -> Layer8MetadataResponse:
+    raw_events = raw_store.list_by_trace_id(trace_id)
+    if not raw_events:
+        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+
+    parse_result = parse_raw_events(raw_events)
+    validation_result = validate_parsed_events(
+        {
+            "parsed_events": [
+                {
+                    "raw_event_id": item.raw_event_id,
+                    "tenant_id": item.tenant_id,
+                    "user_id": item.user_id,
+                    "trace_id": item.trace_id,
+                    "source": str(item.source),
+                    "source_event_id": item.source_event_id,
+                    "occurred_at": item.occurred_at.isoformat(),
+                    "event_type": str(item.event_type),
+                    "normalized": item.normalized,
+                    "parse_warnings": item.parse_warnings,
+                }
+                for item in parse_result.parsed_events
+            ]
+        }
+    )
+    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    metadata_result = extract_metadata_candidates(enrichment_result.model_dump(mode="json"))
+    updated_count = entity_store.upsert_metadata(metadata_result.candidates)
+    return Layer8MetadataResponse(
+        trace_id=trace_id,
+        candidate_count=metadata_result.candidate_count,
+        updated_count=updated_count,
+        store=entity_store.store_name,
+    )
+
+
+@router.post("/layer9/semantic/{trace_id}", response_model=Layer9SemanticResponse)
+def semantic_layer9_by_trace(
+    trace_id: str,
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    entity_store: EntityStore = Depends(get_entity_store),
+    search_store: SearchDocumentStore = Depends(get_search_document_store),
+) -> Layer9SemanticResponse:
+    raw_events = raw_store.list_by_trace_id(trace_id)
+    if not raw_events:
+        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+
+    parse_result = parse_raw_events(raw_events)
+    validation_result = validate_parsed_events(
+        {
+            "parsed_events": [
+                {
+                    "raw_event_id": item.raw_event_id,
+                    "tenant_id": item.tenant_id,
+                    "user_id": item.user_id,
+                    "trace_id": item.trace_id,
+                    "source": str(item.source),
+                    "source_event_id": item.source_event_id,
+                    "occurred_at": item.occurred_at.isoformat(),
+                    "event_type": str(item.event_type),
+                    "normalized": item.normalized,
+                    "parse_warnings": item.parse_warnings,
+                }
+                for item in parse_result.parsed_events
+            ]
+        }
+    )
+    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+
+    # Ensure entities exist so semantic docs can bind entity_id.
+    exact_match = extract_entity_candidates(enrichment_result.model_dump(mode="json"))
+    merge_result = merge_entity_candidates(exact_match.model_dump(mode="json"))
+    entity_store.upsert_entities(merge_result.resolved_entities)
+
+    semantic_result = build_semantic_documents(enrichment_result.model_dump(mode="json"))
+    persist_result = search_store.persist_documents(semantic_result.documents)
+    return Layer9SemanticResponse(
+        trace_id=trace_id,
+        document_count=persist_result.candidate_count,
+        stored_count=persist_result.stored_count,
+        skipped_no_entity=persist_result.skipped_no_entity,
+        store=search_store.store_name,
+    )
+
+
+@router.post("/layer10/embed/{trace_id}", response_model=Layer10EmbeddingResponse)
+def embedding_layer10_by_trace(
+    trace_id: str,
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    entity_store: EntityStore = Depends(get_entity_store),
+    search_store: SearchDocumentStore = Depends(get_search_document_store),
+    embedding_store: EmbeddingStore = Depends(get_embedding_store),
+) -> Layer10EmbeddingResponse:
+    raw_events = raw_store.list_by_trace_id(trace_id)
+    if not raw_events:
+        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+
+    parse_result = parse_raw_events(raw_events)
+    validation_result = validate_parsed_events(
+        {
+            "parsed_events": [
+                {
+                    "raw_event_id": item.raw_event_id,
+                    "tenant_id": item.tenant_id,
+                    "user_id": item.user_id,
+                    "trace_id": item.trace_id,
+                    "source": str(item.source),
+                    "source_event_id": item.source_event_id,
+                    "occurred_at": item.occurred_at.isoformat(),
+                    "event_type": str(item.event_type),
+                    "normalized": item.normalized,
+                    "parse_warnings": item.parse_warnings,
+                }
+                for item in parse_result.parsed_events
+            ]
+        }
+    )
+    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    exact_match = extract_entity_candidates(enrichment_result.model_dump(mode="json"))
+    merge_result = merge_entity_candidates(exact_match.model_dump(mode="json"))
+    entity_store.upsert_entities(merge_result.resolved_entities)
+
+    semantic_result = build_semantic_documents(enrichment_result.model_dump(mode="json"))
+    search_store.persist_documents(semantic_result.documents)
+
+    requests = build_embedding_requests(semantic_result.model_dump(mode="json"))
+    lookup = embedding_cache_lookup(requests)
+    generated = generate_embeddings(lookup.misses)
+    combined_records = lookup.hits + generated.generated
+    cache_store_count = embedding_cache_store(generated.generated)
+    persist_result = embedding_store.persist_vectors(combined_records)
+
+    return Layer10EmbeddingResponse(
+        trace_id=trace_id,
+        candidate_count=lookup.candidate_count,
+        cache_hit_count=lookup.cache_hit_count,
+        cache_miss_count=lookup.cache_miss_count,
+        generated_count=generated.generated_count,
+        cache_store_count=cache_store_count,
+        persisted_count=persist_result.persisted_count,
+        skipped_no_entity=persist_result.skipped_no_entity,
+        store=embedding_store.store_name,
+    )
+
+
+@router.post("/layer11/cache/{trace_id}", response_model=Layer11CacheResponse)
+def cache_layer11_by_trace(
+    trace_id: str,
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+) -> Layer11CacheResponse:
+    raw_events = raw_store.list_by_trace_id(trace_id)
+    if not raw_events:
+        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+
+    parse_result = parse_raw_events(raw_events)
+    validation_result = validate_parsed_events(
+        {
+            "parsed_events": [
+                {
+                    "raw_event_id": item.raw_event_id,
+                    "tenant_id": item.tenant_id,
+                    "user_id": item.user_id,
+                    "trace_id": item.trace_id,
+                    "source": str(item.source),
+                    "source_event_id": item.source_event_id,
+                    "occurred_at": item.occurred_at.isoformat(),
+                    "event_type": str(item.event_type),
+                    "normalized": item.normalized,
+                    "parse_warnings": item.parse_warnings,
+                }
+                for item in parse_result.parsed_events
+            ]
+        }
+    )
+    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+
+    enrichment_cached = 0
+    for event in enrichment_result.parsed_events:
+        key = f"{event.get('tenant_id')}:{event.get('source_event_id')}"
+        cache_registry.put(namespace="enrichment", version="v1", key=key, value=dict(event))
+        enrichment_cached += 1
+
+    semantic_result = build_semantic_documents(enrichment_result.model_dump(mode="json"))
+    requests = build_embedding_requests(semantic_result.model_dump(mode="json"))
+    lookup = embedding_cache_lookup(requests)
+    generated = generate_embeddings(lookup.misses)
+    combined_records = lookup.hits + generated.generated
+    embedding_cached = embedding_cache_store(combined_records)
+    for record in combined_records:
+        key = f"{record.tenant_id}:{record.doc_type}:{record.content}"
+        cache_registry.put(
+            namespace="embedding",
+            version="v1",
+            key=key,
+            value={"embedding": record.embedding},
+        )
+
+    stats = cache_registry.stats()
+    return Layer11CacheResponse(
+        trace_id=trace_id,
+        enrichment_cached_count=enrichment_cached,
+        embedding_cached_count=embedding_cached,
+        total_entries=int(stats.get("total_entries", 0)),
+        namespaces={k: int(v) for k, v in dict(stats.get("namespaces", {})).items()},
+    )
+
+
+@router.post("/layer12/index/{trace_id}", response_model=Layer12IndexResponse)
+def index_layer12_by_trace(
+    trace_id: str,
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    entity_store: EntityStore = Depends(get_entity_store),
+    search_store: SearchDocumentStore = Depends(get_search_document_store),
+    embedding_store: EmbeddingStore = Depends(get_embedding_store),
+    index_store: SearchIndexStore = Depends(get_search_index_store),
+) -> Layer12IndexResponse:
+    raw_events = raw_store.list_by_trace_id(trace_id)
+    if not raw_events:
+        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+
+    parse_result = parse_raw_events(raw_events)
+    validation_result = validate_parsed_events(
+        {
+            "parsed_events": [
+                {
+                    "raw_event_id": item.raw_event_id,
+                    "tenant_id": item.tenant_id,
+                    "user_id": item.user_id,
+                    "trace_id": item.trace_id,
+                    "source": str(item.source),
+                    "source_event_id": item.source_event_id,
+                    "occurred_at": item.occurred_at.isoformat(),
+                    "event_type": str(item.event_type),
+                    "normalized": item.normalized,
+                    "parse_warnings": item.parse_warnings,
+                }
+                for item in parse_result.parsed_events
+            ]
+        }
+    )
+    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    exact_match = extract_entity_candidates(enrichment_result.model_dump(mode="json"))
+    merge_result = merge_entity_candidates(exact_match.model_dump(mode="json"))
+    entity_store.upsert_entities(merge_result.resolved_entities)
+
+    semantic_result = build_semantic_documents(enrichment_result.model_dump(mode="json"))
+    search_store.persist_documents(semantic_result.documents)
+
+    requests = build_embedding_requests(semantic_result.model_dump(mode="json"))
+    lookup = embedding_cache_lookup(requests)
+    generated = generate_embeddings(lookup.misses)
+    records = lookup.hits + generated.generated
+    embedding_cache_store(records)
+    embedding_store.persist_vectors(records)
+
+    signals = build_hybrid_signals(
+        {"records": [r.model_dump(mode="json") for r in records]}
+    )
+    persisted = index_store.apply_hybrid_signals(signals.signals)
+    tenant_id = raw_events[0].tenant_id
+    health = index_store.health_check(tenant_id)
+
+    return Layer12IndexResponse(
+        trace_id=trace_id,
+        signal_count=signals.signal_count,
+        applied_count=persisted.applied_count,
+        skipped_no_entity=persisted.skipped_no_entity,
+        health=health,
+        store=index_store.store_name,
     )
 
 
