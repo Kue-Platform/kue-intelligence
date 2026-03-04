@@ -1,0 +1,3 @@
+setup:
+  - project: kue-intelligence
+    config: dev
