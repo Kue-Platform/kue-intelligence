@@ -297,25 +297,10 @@ class SupabaseEntityStore(EntityStore):
         body = (response.text or "").lower()
         return response.status_code == 409 or "23505" in body
 
-    def _bulk_fetch_identities(self, tenant_id: str, source_identities: list[str]) -> dict[str, str]:
-        """Return {source_identity -> entity_id} for all known identities in one GET."""
-        if not source_identities:
-            return {}
-        response = httpx.get(
-            self._url("entity_identities"),
-            headers=self._base_headers,
-            params={
-                "tenant_id": f"eq.{tenant_id}",
-                "source_identity": f"in.({','.join(source_identities)})",
-                "select": "source_identity,entity_id",
-            },
-            timeout=30.0,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Supabase entity_identities bulk fetch failed ({response.status_code}): {response.text}"
-            )
-        return {row["source_identity"]: str(row["entity_id"]) for row in response.json()}
+    @property
+    def _upsert_headers(self) -> dict[str, str]:
+        """Headers for a native PostgREST upsert (on_conflict + merge-duplicates)."""
+        return {**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"}
 
     def _bulk_fetch_entities_by_email(self, tenant_id: str, emails: list[str]) -> dict[str, str]:
         """Return {primary_email -> entity_id} for all known emails in one GET."""
@@ -349,27 +334,20 @@ class SupabaseEntityStore(EntityStore):
         total_created = total_updated = total_identities = 0
 
         for tenant_id, candidates in by_tenant.items():
-            # ── 1. Bulk-resolve already-known source identities ────────────────
-            known_identities = self._bulk_fetch_identities(
-                tenant_id, [c.source_event_id for c in candidates]
-            )
+            # ── 1. Bulk-fetch existing entities by email (1 GET) ───────────────
+            # We still need entity_id values to write entity_identities rows.
+            emails = [c.primary_email for c in candidates if c.primary_email]
+            known_by_email = self._bulk_fetch_entities_by_email(tenant_id, emails)
 
-            # ── 2. For unresolved candidates, match by email ───────────────────
-            unresolved = [c for c in candidates if c.source_event_id not in known_identities]
-            known_by_email = self._bulk_fetch_entities_by_email(
-                tenant_id, [c.primary_email for c in unresolved if c.primary_email]
-            )
+            # Split into new vs existing
+            new_candidates = [c for c in candidates if not known_by_email.get(c.primary_email)]
+            existing_candidates = [c for c in candidates if known_by_email.get(c.primary_email)]
 
-            # Build full entity_id map: source_identity -> entity_id
-            entity_id_map: dict[str, str] = dict(known_identities)
-            existing_source_ids = set(known_identities.keys())
-            for c in unresolved:
-                if c.primary_email and c.primary_email in known_by_email:
-                    entity_id_map[c.source_event_id] = known_by_email[c.primary_email]
-                    existing_source_ids.add(c.source_event_id)
+            entity_id_map: dict[str, str] = {}
+            for c in existing_candidates:
+                entity_id_map[c.source_event_id] = known_by_email[c.primary_email]
 
-            # ── 3. Bulk-insert brand-new entities ─────────────────────────────
-            new_candidates = [c for c in candidates if c.source_event_id not in entity_id_map]
+            # ── 2. Bulk-insert new entities (1 POST, return=representation) ────
             if new_candidates:
                 ins_resp = httpx.post(
                     self._url("entities"),
@@ -388,52 +366,18 @@ class SupabaseEntityStore(EntityStore):
                     timeout=30.0,
                 )
                 if ins_resp.status_code >= 400:
-                    if not self._is_conflict(ins_resp):
-                        raise RuntimeError(
-                            f"Supabase entities bulk insert failed ({ins_resp.status_code}): {ins_resp.text}"
-                        )
-                    # Conflict: insert one-by-one
-                    for c in new_candidates:
-                        sr = httpx.post(
-                            self._url("entities"),
-                            headers={**self._base_headers, "Prefer": "return=representation"},
-                            json=[{
-                                "tenant_id": c.tenant_id,
-                                "display_name": c.display_name,
-                                "primary_email": c.primary_email,
-                                "company_norm": c.company_norm,
-                                "title_norm": c.title_norm,
-                                "metadata_json": c.metadata_json,
-                            }],
-                            timeout=20.0,
-                        )
-                        if sr.status_code >= 400:
-                            if not self._is_conflict(sr):
-                                raise RuntimeError(
-                                    f"Supabase entities insert failed ({sr.status_code}): {sr.text}"
-                                )
-                            if c.primary_email:
-                                fetched = self._bulk_fetch_entities_by_email(tenant_id, [c.primary_email])
-                                if c.primary_email in fetched:
-                                    entity_id_map[c.source_event_id] = fetched[c.primary_email]
-                                    total_updated += 1
-                        else:
-                            rows = sr.json()
-                            if rows:
-                                entity_id_map[c.source_event_id] = str(rows[0]["entity_id"])
-                                total_created += 1
-                else:
-                    returned = {row.get("primary_email"): str(row["entity_id"]) for row in ins_resp.json()}
-                    for c in new_candidates:
-                        eid = returned.get(c.primary_email)
-                        if eid:
-                            entity_id_map[c.source_event_id] = eid
-                            total_created += 1
+                    raise RuntimeError(
+                        f"Supabase entities bulk insert failed ({ins_resp.status_code}): {ins_resp.text}"
+                    )
+                returned = {row.get("primary_email"): str(row["entity_id"]) for row in ins_resp.json()}
+                for c in new_candidates:
+                    eid = returned.get(c.primary_email)
+                    if eid:
+                        entity_id_map[c.source_event_id] = eid
+                        total_created += 1
 
-            # ── 4. Update already-existing entities (per-row PATCH) ────────────
-            for c in candidates:
-                if c.source_event_id not in existing_source_ids:
-                    continue
+            # ── 3. Update existing entities (per-row PATCH) ────────────────────
+            for c in existing_candidates:
                 entity_id = entity_id_map.get(c.source_event_id)
                 if not entity_id:
                     continue
@@ -452,7 +396,8 @@ class SupabaseEntityStore(EntityStore):
                 )
                 total_updated += 1
 
-            # ── 5. Bulk-insert all entity_identities ───────────────────────────
+            # ── 4. Native upsert all entity_identities (1 POST) ───────────────
+            # on_conflict=(tenant_id,source,source_identity) → merge-duplicates
             identity_rows = [
                 {
                     "tenant_id": c.tenant_id,
@@ -470,32 +415,15 @@ class SupabaseEntityStore(EntityStore):
             if identity_rows:
                 id_resp = httpx.post(
                     self._url("entity_identities"),
-                    headers=self._base_headers,
+                    headers=self._upsert_headers,
+                    params={"on_conflict": "tenant_id,source,source_identity"},
                     json=identity_rows,
                     timeout=30.0,
                 )
                 if id_resp.status_code >= 400:
-                    if not self._is_conflict(id_resp):
-                        raise RuntimeError(
-                            f"Supabase entity_identities bulk insert failed ({id_resp.status_code}): {id_resp.text}"
-                        )
-                    # Fallback: PATCH each existing identity
-                    for row in identity_rows:
-                        httpx.patch(
-                            self._url("entity_identities"),
-                            headers=self._base_headers,
-                            params={
-                                "tenant_id": f"eq.{row['tenant_id']}",
-                                "source": f"eq.{row['source']}",
-                                "source_identity": f"eq.{row['source_identity']}",
-                            },
-                            json={
-                                "entity_id": row["entity_id"],
-                                "email": row["email"],
-                                "raw_event_id": row["raw_event_id"],
-                            },
-                            timeout=20.0,
-                        )
+                    raise RuntimeError(
+                        f"Supabase entity_identities upsert failed ({id_resp.status_code}): {id_resp.text}"
+                    )
                 total_identities += len(identity_rows)
 
         return EntityPersistResult(len(resolved_entities), total_created, total_updated, total_identities)

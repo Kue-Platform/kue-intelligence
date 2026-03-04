@@ -193,7 +193,7 @@ class SupabaseRelationshipStore(RelationshipStore):
         interactions: list[InteractionCandidate],
         relationships: list[RelationshipAggregate],
     ) -> RelationshipPersistResult:
-        # ── Insert interaction_facts (already bulk - no change needed) ─────────
+        # ── Insert interaction_facts ───────────────────────────────────────────
         if interactions:
             payload = [
                 {
@@ -224,7 +224,7 @@ class SupabaseRelationshipStore(RelationshipStore):
                 relationships_upserted=0,
             )
 
-        # ── 1. Bulk-resolve all entity IDs in one GET per tenant ──────────────
+        # ── 1. Bulk-resolve entity IDs by email (1 GET per tenant) ────────────
         from collections import defaultdict
         by_tenant: dict[str, list[RelationshipAggregate]] = defaultdict(list)
         for rel in relationships:
@@ -233,135 +233,45 @@ class SupabaseRelationshipStore(RelationshipStore):
         total_upserted = 0
 
         for tenant_id, rels in by_tenant.items():
-            # Collect unique emails
             all_emails = list({email for rel in rels for email in (rel.from_email, rel.to_email)})
             email_to_id = self._bulk_resolve_entity_ids(tenant_id, all_emails)
 
-            # Build resolved payloads (skip pairs where either entity is unknown)
-            resolved: list[tuple[RelationshipAggregate, str, str]] = []
+            # Build rows — skip pairs where either entity is not yet resolved
+            rows: list[dict] = []
             for rel in rels:
                 from_id = email_to_id.get(rel.from_email)
                 to_id = email_to_id.get(rel.to_email)
-                if from_id and to_id:
-                    resolved.append((rel, from_id, to_id))
+                if not from_id or not to_id:
+                    continue
+                rows.append({
+                    "tenant_id": rel.tenant_id,
+                    "from_entity_id": from_id,
+                    "to_entity_id": to_id,
+                    "relationship_type": rel.relationship_type,
+                    "strength": rel.strength,
+                    "first_interaction_at": rel.first_interaction_at,
+                    "last_interaction_at": rel.last_interaction_at,
+                    "interaction_count": rel.interaction_count,
+                    "evidence_json": rel.evidence_json,
+                })
 
-            if not resolved:
+            if not rows:
                 continue
 
-            # ── 2. Bulk-fetch existing relationships in one GET ────────────────
-            # Build composite key set for lookup
-            existing_keys: set[tuple[str, str, str]] = set()
-            # PostgREST doesn't support multi-column in() natively, so fetch all
-            # for this tenant and filter locally.
-            ex_resp = httpx.get(
+            # ── 2. Native upsert — Postgres handles insert/update atomically ───
+            # on_conflict=(tenant_id,from_entity_id,to_entity_id,relationship_type)
+            upsert_resp = httpx.post(
                 self._url("relationships"),
-                headers=self._base_headers,
-                params={
-                    "tenant_id": f"eq.{tenant_id}",
-                    "select": "from_entity_id,to_entity_id,relationship_type",
-                },
+                headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                params={"on_conflict": "tenant_id,from_entity_id,to_entity_id,relationship_type"},
+                json=rows,
                 timeout=30.0,
             )
-            if ex_resp.status_code >= 400:
+            if upsert_resp.status_code >= 400:
                 raise RuntimeError(
-                    f"Supabase relationships fetch failed ({ex_resp.status_code}): {ex_resp.text}"
+                    f"Supabase relationships upsert failed ({upsert_resp.status_code}): {upsert_resp.text}"
                 )
-            for row in ex_resp.json():
-                existing_keys.add((
-                    str(row["from_entity_id"]),
-                    str(row["to_entity_id"]),
-                    str(row["relationship_type"]),
-                ))
-
-            # ── 3. Split into new vs existing ─────────────────────────────────
-            to_insert: list[dict] = []
-            to_update: list[tuple[RelationshipAggregate, str, str]] = []
-
-            for rel, from_id, to_id in resolved:
-                key = (from_id, to_id, rel.relationship_type)
-                if key in existing_keys:
-                    to_update.append((rel, from_id, to_id))
-                else:
-                    to_insert.append({
-                        "tenant_id": rel.tenant_id,
-                        "from_entity_id": from_id,
-                        "to_entity_id": to_id,
-                        "relationship_type": rel.relationship_type,
-                        "strength": rel.strength,
-                        "first_interaction_at": rel.first_interaction_at,
-                        "last_interaction_at": rel.last_interaction_at,
-                        "interaction_count": rel.interaction_count,
-                        "evidence_json": rel.evidence_json,
-                    })
-
-            # ── 4. Bulk-insert new relationships ──────────────────────────────
-            if to_insert:
-                ins_resp = httpx.post(
-                    self._url("relationships"),
-                    headers=self._base_headers,
-                    json=to_insert,
-                    timeout=30.0,
-                )
-                if ins_resp.status_code >= 400:
-                    if not self._is_conflict(ins_resp):
-                        raise RuntimeError(
-                            f"Supabase relationships bulk insert failed ({ins_resp.status_code}): {ins_resp.text}"
-                        )
-                    # Conflict: fall back to one-by-one with PATCH on conflict
-                    for row in to_insert:
-                        sr = httpx.post(
-                            self._url("relationships"),
-                            headers=self._base_headers,
-                            json=[row],
-                            timeout=20.0,
-                        )
-                        if sr.status_code >= 400:
-                            if not self._is_conflict(sr):
-                                raise RuntimeError(
-                                    f"Supabase relationships insert failed ({sr.status_code}): {sr.text}"
-                                )
-                            # Race-condition: patch
-                            httpx.patch(
-                                self._url("relationships"),
-                                headers=self._base_headers,
-                                params={
-                                    "tenant_id": f"eq.{row['tenant_id']}",
-                                    "from_entity_id": f"eq.{row['from_entity_id']}",
-                                    "to_entity_id": f"eq.{row['to_entity_id']}",
-                                    "relationship_type": f"eq.{row['relationship_type']}",
-                                },
-                                json={
-                                    "strength": row["strength"],
-                                    "first_interaction_at": row["first_interaction_at"],
-                                    "last_interaction_at": row["last_interaction_at"],
-                                    "interaction_count": row["interaction_count"],
-                                    "evidence_json": row["evidence_json"],
-                                },
-                                timeout=20.0,
-                            )
-                total_upserted += len(to_insert)
-
-            # ── 5. Update existing relationships (per-row PATCH) ──────────────
-            for rel, from_id, to_id in to_update:
-                httpx.patch(
-                    self._url("relationships"),
-                    headers=self._base_headers,
-                    params={
-                        "tenant_id": f"eq.{rel.tenant_id}",
-                        "from_entity_id": f"eq.{from_id}",
-                        "to_entity_id": f"eq.{to_id}",
-                        "relationship_type": f"eq.{rel.relationship_type}",
-                    },
-                    json={
-                        "strength": rel.strength,
-                        "first_interaction_at": rel.first_interaction_at,
-                        "last_interaction_at": rel.last_interaction_at,
-                        "interaction_count": rel.interaction_count,
-                        "evidence_json": rel.evidence_json,
-                    },
-                    timeout=20.0,
-                )
-                total_upserted += 1
+            total_upserted += len(rows)
 
         return RelationshipPersistResult(
             interaction_count=len(interactions),
@@ -375,5 +285,3 @@ def create_relationship_store(settings: Settings) -> RelationshipStore:
         api_key = settings.supabase_service_role_key or settings.supabase_anon_key
         return SupabaseRelationshipStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqliteRelationshipStore(db_path=settings.pipeline_db_path)
-
-
