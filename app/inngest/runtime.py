@@ -435,6 +435,59 @@ def _cache_metrics_snapshot() -> dict[str, Any]:
     return {"stats": stats}
 
 
+def _fetch_and_process_raw(trace_id: str) -> dict[str, Any]:
+    """Group 1 collapse: fetch raw events (1 DB read) + parse + validate + enrich (all pure Python).
+
+    Replaces 4 Inngest steps (fetch_raw, parse, validate_canonical, clean_and_enrich)
+    each of which was serializing/deserializing the full raw event blob.
+    """
+    raw = _fetch_raw_events(trace_id)
+    parsed = _parse_raw_events(list(raw.get("events", [])))
+    validated = validate_parsed_events(dict(parsed)).model_dump(mode="json")
+    enriched = clean_and_enrich_events(dict(validated)).model_dump(mode="json")
+    return {
+        "raw_count": raw.get("count", 0),
+        "parse_result": parsed,
+        "validation_result": validated,
+        "enrichment_result": enriched,
+    }
+
+
+def _post_embedding_process(vectors_payload: dict[str, Any]) -> dict[str, Any]:
+    """Group 2 collapse: cache_store + write_embedding_cache (no-op) + cache_metrics + build_hybrid_signals.
+
+    All 4 are pure Python / in-memory. The embedding_vectors payload (1536-dim × N)
+    was being serialized 4 times for these steps. Now serialized once.
+    """
+    cache_stored = _embedding_cache_store(vectors_payload)
+    # write_embedding_cache is intentionally a no-op (in-memory cache resets per step)
+    signals = build_hybrid_signals(vectors_payload).model_dump(mode="json")
+    metrics = _cache_metrics_snapshot()
+    return {
+        "cache_store_count": cache_stored.get("cache_store_count", 0),
+        "cached_count": 0,       # write_embedding_cache no-op
+        "stats": metrics.get("stats", {}),
+        "signals": signals.get("signals", []),
+        "signal_count": signals.get("signal_count", 0),
+    }
+
+
+def _project_graph(prepare_result: dict[str, Any]) -> dict[str, Any]:
+    """Group 3 collapse: graph_project_nodes + graph_project_edges in one step.
+
+    Both read from the same prepare_result snapshot, both write to Neo4j,
+    and neither depends on the other's output. graph_finalize needs both results.
+    """
+    node_result = _graph_project_nodes(prepare_result)
+    edge_result = _graph_project_edges(prepare_result)
+    return {
+        "node_result": node_result,
+        "edge_result": edge_result,
+        "nodes_by_label": node_result.get("nodes_by_label", {}),
+        "edges_by_type": edge_result.get("edges_by_type", {}),
+    }
+
+
 def _persist_search_index(signals_payload: dict[str, Any]) -> dict[str, Any]:
     from app.ingestion.search_indexing import HybridSignal
 
@@ -593,6 +646,8 @@ def _run_layer_internal(
             result = validate_parsed_events(dict(payload["parse_result"])).model_dump(mode="json")
         elif op == "clean_and_enrich":
             result = clean_and_enrich_events(dict(payload["validation_result"])).model_dump(mode="json")
+        elif op == "fetch_and_process_raw":
+            result = _fetch_and_process_raw(str(payload["trace_id"]))
         elif op == "process_enrichment":
             result = _process_enrichment(dict(payload["enrichment_result"]))
         elif op == "entity_persist":
@@ -610,16 +665,10 @@ def _run_layer_internal(
             result = _embedding_cache_lookup(dict(payload["semantic_result"]))
         elif op == "embedding_generate":
             result = _generate_embedding_vectors(dict(payload["cache_lookup_result"]))
-        elif op == "embedding_cache_store":
-            result = _embedding_cache_store(dict(payload["vectors_result"]))
         elif op == "embedding_persist":
             result = _persist_embeddings(dict(payload["vectors_result"]))
-        elif op == "cache_embeddings":
-            result = _cache_embeddings(dict(payload["vectors_result"]))
-        elif op == "cache_metrics_snapshot":
-            result = _cache_metrics_snapshot()
-        elif op == "build_hybrid_signals":
-            result = build_hybrid_signals(dict(payload["vectors_result"])).model_dump(mode="json")
+        elif op == "post_embedding_process":
+            result = _post_embedding_process(dict(payload["vectors_result"]))
         elif op == "persist_search_index":
             result = _persist_search_index(dict(payload["signals_result"]))
         elif op == "graph_prepare":
@@ -628,10 +677,8 @@ def _run_layer_internal(
                 str(payload["user_id"]),
                 str(payload["trace_id"]),
             )
-        elif op == "graph_project_nodes":
-            result = _graph_project_nodes(dict(payload["prepare_result"]))
-        elif op == "graph_project_edges":
-            result = _graph_project_edges(dict(payload["prepare_result"]))
+        elif op == "project_graph":
+            result = _project_graph(dict(payload["prepare_result"]))
         elif op == "graph_finalize":
             result = _graph_finalize(
                 str(payload["run_id"]),
@@ -691,25 +738,14 @@ def _layer_persist_raw_events(run_id: str, source_events_payload: list[dict[str,
     )
 
 
-def _layer_fetch_raw_events(run_id: str, trace_id: str) -> dict[str, Any]:
+def _layer_fetch_and_process_raw(run_id: str, trace_id: str) -> dict[str, Any]:
     return _run_layer_internal(
         run_id=run_id,
         stage_key="canonicalization",
-        layer_key="fetch_raw",
+        layer_key="fetch_and_process",
         records_in=None,
-        op="fetch_raw_events",
+        op="fetch_and_process_raw",
         payload={"trace_id": trace_id},
-    )
-
-
-def _layer_parse_raw_events(run_id: str, raw_events: list[dict[str, Any]]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="canonicalization",
-        layer_key="parse",
-        records_in=len(raw_events),
-        op="parse_raw_events",
-        payload={"raw_events": raw_events},
     )
 
 
@@ -728,28 +764,6 @@ def _layer_persist_canonical(
         records_in=parsed_count,
         op="persist_canonical",
         payload={"parse_result": parse_result, "parser_version": parser_version},
-    )
-
-
-def _layer_validate_canonical(run_id: str, parse_result: dict[str, Any]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="validation",
-        layer_key="schema_enforcement",
-        records_in=int(parse_result.get("parsed_count", 0)),
-        op="validate_canonical",
-        payload={"parse_result": parse_result},
-    )
-
-
-def _layer_clean_and_enrich(run_id: str, validation_result: dict[str, Any]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="cleaning_enrichment",
-        layer_key="normalize_and_enrich",
-        records_in=int(validation_result.get("valid_count", 0)),
-        op="clean_and_enrich",
-        payload={"validation_result": validation_result},
     )
 
 
@@ -867,6 +881,17 @@ def _layer_embedding_cache_store(run_id: str, vectors_result: dict[str, Any]) ->
     )
 
 
+def _layer_post_embedding_process(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
+    return _run_layer_internal(
+        run_id=run_id,
+        stage_key="embedding",
+        layer_key="post_process",
+        records_in=int(vectors_result.get("generated_count", 0)),
+        op="post_embedding_process",
+        payload={"vectors_result": vectors_result},
+    )
+
+
 def _layer_embedding_persist(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
     return _run_layer_internal(
         run_id=run_id,
@@ -874,38 +899,6 @@ def _layer_embedding_persist(run_id: str, vectors_result: dict[str, Any]) -> dic
         layer_key="persist_vectors",
         records_in=int(vectors_result.get("candidate_count", 0)),
         op="embedding_persist",
-        payload={"vectors_result": vectors_result},
-    )
-
-def _layer_cache_embeddings(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="caching",
-        layer_key="write_embedding_cache",
-        records_in=int(vectors_result.get("candidate_count", 0)),
-        op="cache_embeddings",
-        payload={"vectors_result": vectors_result},
-    )
-
-
-def _layer_cache_metrics(run_id: str) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="caching",
-        layer_key="cache_metrics_snapshot",
-        records_in=None,
-        op="cache_metrics_snapshot",
-        payload={},
-    )
-
-
-def _layer_build_hybrid_signals(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="search_indexing",
-        layer_key="materialize_hybrid_signals",
-        records_in=int(vectors_result.get("candidate_count", 0)),
-        op="build_hybrid_signals",
         payload={"vectors_result": vectors_result},
     )
 
@@ -931,41 +924,13 @@ def _layer_graph_prepare(run_id: str, tenant_id: str, user_id: str, trace_id: st
         payload={"tenant_id": tenant_id, "user_id": user_id, "trace_id": trace_id},
     )
 
-
-def _layer_graph_project_nodes(run_id: str, prepare_result: dict[str, Any]) -> dict[str, Any]:
-    snapshot = dict(prepare_result.get("snapshot", {}))
-    records_in = (
-        len(list(snapshot.get("persons", [])))
-        + len(list(snapshot.get("users", [])))
-        + len(list(snapshot.get("companies", [])))
-        + len(list(snapshot.get("topics", [])))
-    )
+def _layer_project_graph(run_id: str, prepare_result: dict[str, Any]) -> dict[str, Any]:
     return _run_layer_internal(
         run_id=run_id,
         stage_key="graph_projection",
-        layer_key="project_nodes",
-        records_in=records_in,
-        op="graph_project_nodes",
-        payload={"prepare_result": prepare_result},
-    )
-
-
-def _layer_graph_project_edges(run_id: str, prepare_result: dict[str, Any]) -> dict[str, Any]:
-    snapshot = dict(prepare_result.get("snapshot", {}))
-    records_in = (
-        len(list(snapshot.get("knows_edges", [])))
-        + len(list(snapshot.get("interacted_edges", [])))
-        + len(list(snapshot.get("works_at_edges", [])))
-        + len(list(snapshot.get("member_of_edges", [])))
-        + len(list(snapshot.get("has_topic_edges", [])))
-        + len(list(snapshot.get("intro_path_edges", [])))
-    )
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="graph_projection",
-        layer_key="project_edges",
-        records_in=records_in,
-        op="graph_project_edges",
+        layer_key="project",
+        records_in=None,
+        op="project_graph",
         payload={"prepare_result": prepare_result},
     )
 
@@ -1046,42 +1011,24 @@ async def _run_pipeline_core(
             source_events_payload,
         )
 
-        raw_fetch = await ctx.step.run(
-            "stage.canonicalization.layer.fetch_raw",
-            _layer_fetch_raw_events,
+        raw_process = await ctx.step.run(
+            "stage.canonicalization.layer.fetch_and_process",
+            _layer_fetch_and_process_raw,
             run_id,
             trace_id,
-        )
-        parse_result = await ctx.step.run(
-            "stage.canonicalization.layer.parse",
-            _layer_parse_raw_events,
-            run_id,
-            list(raw_fetch.get("events", [])),
-        )
-        validation_result = await ctx.step.run(
-            "stage.validation.layer.schema_enforcement",
-            _layer_validate_canonical,
-            run_id,
-            parse_result,
-        )
-        enrichment_result = await ctx.step.run(
-            "stage.cleaning_enrichment.layer.normalize_and_enrich",
-            _layer_clean_and_enrich,
-            run_id,
-            validation_result,
         )
         canonical_result = await ctx.step.run(
             "stage.canonicalization.layer.persist",
             _layer_persist_canonical,
             run_id,
-            enrichment_result,
+            raw_process["enrichment_result"],
             parser_version,
         )
         process_result = await ctx.step.run(
             "stage.enrichment.layer.process_all",
             _layer_process_enrichment,
             run_id,
-            enrichment_result,
+            raw_process["enrichment_result"],
         )
         entity_persist = await ctx.step.run(
             "stage.entity_resolution.layer.persist_entities",
@@ -1113,32 +1060,15 @@ async def _run_pipeline_core(
             run_id,
             embedding_lookup,
         )
-        embedding_cache_written = await ctx.step.run(
-            "stage.embedding.layer.cache_store",
-            _layer_embedding_cache_store,
-            run_id,
-            embedding_vectors,
-        )
         embedding_persist = await ctx.step.run(
             "stage.embedding.layer.persist_vectors",
             _layer_embedding_persist,
             run_id,
             embedding_vectors,
         )
-        caching_embeddings = await ctx.step.run(
-            "stage.caching.layer.write_embedding_cache",
-            _layer_cache_embeddings,
-            run_id,
-            embedding_vectors,
-        )
-        caching_metrics = await ctx.step.run(
-            "stage.caching.layer.cache_metrics_snapshot",
-            _layer_cache_metrics,
-            run_id,
-        )
-        hybrid_signals = await ctx.step.run(
-            "stage.search_indexing.layer.materialize_hybrid_signals",
-            _layer_build_hybrid_signals,
+        post_result = await ctx.step.run(
+            "stage.embedding.layer.post_process",
+            _layer_post_embedding_process,
             run_id,
             embedding_vectors,
         )
@@ -1146,7 +1076,7 @@ async def _run_pipeline_core(
             "stage.search_indexing.layer.index_health_check",
             _layer_persist_search_index,
             run_id,
-            hybrid_signals,
+            post_result,
         )
         relationship_persist = await ctx.step.run(
             "stage.relationship_extraction.layer.persist_relationships",
@@ -1163,15 +1093,9 @@ async def _run_pipeline_core(
             user_id,
             trace_id,
         )
-        graph_nodes = await ctx.step.run(
-            "stage.graph_projection.layer.project_nodes",
-            _layer_graph_project_nodes,
-            run_id,
-            graph_prepare,
-        )
-        graph_edges = await ctx.step.run(
-            "stage.graph_projection.layer.project_edges",
-            _layer_graph_project_edges,
+        graph_projection = await ctx.step.run(
+            "stage.graph_projection.layer.project",
+            _layer_project_graph,
             run_id,
             graph_prepare,
         )
@@ -1183,8 +1107,8 @@ async def _run_pipeline_core(
             tenant_id,
             user_id,
             graph_prepare,
-            graph_nodes,
-            graph_edges,
+            graph_projection["node_result"],
+            graph_projection["edge_result"],
         )
         summary = {
             "trace_id": trace_id,
@@ -1192,18 +1116,18 @@ async def _run_pipeline_core(
             "status": "completed",
             "raw_capture": raw_result,
             "canonicalization": {
-                "raw_count": raw_fetch.get("count", 0),
-                "parsed_count": parse_result.get("parsed_count", 0),
-                "failed_count": parse_result.get("failed_count", 0),
+                "raw_count": raw_process.get("raw_count", 0),
+                "parsed_count": raw_process.get("parse_result", {}).get("parsed_count", 0),
+                "failed_count": raw_process.get("parse_result", {}).get("failed_count", 0),
                 **canonical_result,
             },
             "validation": {
-                "valid_count": validation_result.get("valid_count", 0),
-                "invalid_count": validation_result.get("invalid_count", 0),
-                "invalid_events": validation_result.get("invalid_events", []),
+                "valid_count": raw_process.get("validation_result", {}).get("valid_count", 0),
+                "invalid_count": raw_process.get("validation_result", {}).get("invalid_count", 0),
+                "invalid_events": raw_process.get("validation_result", {}).get("invalid_events", []),
             },
             "cleaning_enrichment": {
-                "enriched_count": enrichment_result.get("enriched_count", 0),
+                "enriched_count": raw_process.get("enrichment_result", {}).get("enriched_count", 0),
             },
             "entity_resolution": {
                 "candidate_count": process_result.get("entity_candidate_count", 0),
@@ -1221,15 +1145,15 @@ async def _run_pipeline_core(
                 "cache_hit_count": embedding_lookup.get("cache_hit_count", 0),
                 "cache_miss_count": embedding_lookup.get("cache_miss_count", 0),
                 "generated_count": embedding_vectors.get("generated_count", 0),
-                **embedding_cache_written,
+                "cache_store_count": post_result.get("cache_store_count", 0),
                 **embedding_persist,
             },
             "caching": {
-                "embedding_cached_count": caching_embeddings.get("cached_count", 0),
-                **caching_metrics,
+                "embedding_cached_count": post_result.get("cached_count", 0),
+                "stats": post_result.get("stats", {}),
             },
             "search_indexing": {
-                "signal_count": hybrid_signals.get("signal_count", 0),
+                "signal_count": post_result.get("signal_count", 0),
                 **search_index_result,
             },
             "relationship_extraction": {
@@ -1239,8 +1163,8 @@ async def _run_pipeline_core(
             },
             "graph_projection": {
                 "batch_stats": graph_prepare.get("batch_stats", {}),
-                "nodes_by_label": graph_nodes.get("nodes_by_label", {}),
-                "edges_by_type": graph_edges.get("edges_by_type", {}),
+                "nodes_by_label": graph_projection.get("nodes_by_label", {}),
+                "edges_by_type": graph_projection.get("edges_by_type", {}),
                 "verification": graph_finalize.get("verification", {}),
                 "mirror": graph_finalize.get("mirror", {}),
                 "snapshot_checksum": graph_finalize.get("snapshot_checksum"),
@@ -1335,42 +1259,24 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
     run_id = str(run_info["run_id"])
     trace_id = str(run_info["trace_id"])
     try:
-        raw_fetch = await ctx.step.run(
-            "stage.canonicalization.layer.fetch_raw",
-            _layer_fetch_raw_events,
+        raw_process = await ctx.step.run(
+            "stage.canonicalization.layer.fetch_and_process",
+            _layer_fetch_and_process_raw,
             run_id,
             trace_id,
-        )
-        parse_result = await ctx.step.run(
-            "stage.canonicalization.layer.parse",
-            _layer_parse_raw_events,
-            run_id,
-            list(raw_fetch.get("events", [])),
-        )
-        validation_result = await ctx.step.run(
-            "stage.validation.layer.schema_enforcement",
-            _layer_validate_canonical,
-            run_id,
-            parse_result,
-        )
-        enrichment_result = await ctx.step.run(
-            "stage.cleaning_enrichment.layer.normalize_and_enrich",
-            _layer_clean_and_enrich,
-            run_id,
-            validation_result,
         )
         canonical_result = await ctx.step.run(
             "stage.canonicalization.layer.persist",
             _layer_persist_canonical,
             run_id,
-            enrichment_result,
+            raw_process["enrichment_result"],
             parser_version,
         )
         process_result = await ctx.step.run(
             "stage.enrichment.layer.process_all",
             _layer_process_enrichment,
             run_id,
-            enrichment_result,
+            raw_process["enrichment_result"],
         )
         entity_persist = await ctx.step.run(
             "stage.entity_resolution.layer.persist_entities",
@@ -1402,32 +1308,15 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             run_id,
             embedding_lookup,
         )
-        embedding_cache_written = await ctx.step.run(
-            "stage.embedding.layer.cache_store",
-            _layer_embedding_cache_store,
-            run_id,
-            embedding_vectors,
-        )
         embedding_persist = await ctx.step.run(
             "stage.embedding.layer.persist_vectors",
             _layer_embedding_persist,
             run_id,
             embedding_vectors,
         )
-        caching_embeddings = await ctx.step.run(
-            "stage.caching.layer.write_embedding_cache",
-            _layer_cache_embeddings,
-            run_id,
-            embedding_vectors,
-        )
-        caching_metrics = await ctx.step.run(
-            "stage.caching.layer.cache_metrics_snapshot",
-            _layer_cache_metrics,
-            run_id,
-        )
-        hybrid_signals = await ctx.step.run(
-            "stage.search_indexing.layer.materialize_hybrid_signals",
-            _layer_build_hybrid_signals,
+        post_result = await ctx.step.run(
+            "stage.embedding.layer.post_process",
+            _layer_post_embedding_process,
             run_id,
             embedding_vectors,
         )
@@ -1435,7 +1324,7 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             "stage.search_indexing.layer.index_health_check",
             _layer_persist_search_index,
             run_id,
-            hybrid_signals,
+            post_result,
         )
         relationship_persist = await ctx.step.run(
             "stage.relationship_extraction.layer.persist_relationships",
@@ -1452,15 +1341,9 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             user_id,
             trace_id,
         )
-        graph_nodes = await ctx.step.run(
-            "stage.graph_projection.layer.project_nodes",
-            _layer_graph_project_nodes,
-            run_id,
-            graph_prepare,
-        )
-        graph_edges = await ctx.step.run(
-            "stage.graph_projection.layer.project_edges",
-            _layer_graph_project_edges,
+        graph_projection = await ctx.step.run(
+            "stage.graph_projection.layer.project",
+            _layer_project_graph,
             run_id,
             graph_prepare,
         )
@@ -1472,22 +1355,22 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             tenant_id,
             user_id,
             graph_prepare,
-            graph_nodes,
-            graph_edges,
+            graph_projection["node_result"],
+            graph_projection["edge_result"],
         )
         summary = {
             "trace_id": trace_id,
             "run_id": run_id,
-            "raw_count": raw_fetch.get("count", 0),
-            "parsed_count": parse_result.get("parsed_count", 0),
-            "failed_count": parse_result.get("failed_count", 0),
+            "raw_count": raw_process.get("raw_count", 0),
+            "parsed_count": raw_process.get("parse_result", {}).get("parsed_count", 0),
+            "failed_count": raw_process.get("parse_result", {}).get("failed_count", 0),
             "validation": {
-                "valid_count": validation_result.get("valid_count", 0),
-                "invalid_count": validation_result.get("invalid_count", 0),
-                "invalid_events": validation_result.get("invalid_events", []),
+                "valid_count": raw_process.get("validation_result", {}).get("valid_count", 0),
+                "invalid_count": raw_process.get("validation_result", {}).get("invalid_count", 0),
+                "invalid_events": raw_process.get("validation_result", {}).get("invalid_events", []),
             },
             "cleaning_enrichment": {
-                "enriched_count": enrichment_result.get("enriched_count", 0),
+                "enriched_count": raw_process.get("enrichment_result", {}).get("enriched_count", 0),
             },
             "entity_resolution": {
                 "candidate_count": process_result.get("entity_candidate_count", 0),
@@ -1505,15 +1388,15 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
                 "cache_hit_count": embedding_lookup.get("cache_hit_count", 0),
                 "cache_miss_count": embedding_lookup.get("cache_miss_count", 0),
                 "generated_count": embedding_vectors.get("generated_count", 0),
-                **embedding_cache_written,
+                "cache_store_count": post_result.get("cache_store_count", 0),
                 **embedding_persist,
             },
             "caching": {
-                "embedding_cached_count": caching_embeddings.get("cached_count", 0),
-                **caching_metrics,
+                "embedding_cached_count": post_result.get("cached_count", 0),
+                "stats": post_result.get("stats", {}),
             },
             "search_indexing": {
-                "signal_count": hybrid_signals.get("signal_count", 0),
+                "signal_count": post_result.get("signal_count", 0),
                 **search_index_result,
             },
             "relationship_extraction": {
@@ -1523,8 +1406,8 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             },
             "graph_projection": {
                 "batch_stats": graph_prepare.get("batch_stats", {}),
-                "nodes_by_label": graph_nodes.get("nodes_by_label", {}),
-                "edges_by_type": graph_edges.get("edges_by_type", {}),
+                "nodes_by_label": graph_projection.get("nodes_by_label", {}),
+                "edges_by_type": graph_projection.get("edges_by_type", {}),
                 "verification": graph_finalize.get("verification", {}),
                 "mirror": graph_finalize.get("mirror", {}),
                 "snapshot_checksum": graph_finalize.get("snapshot_checksum"),
