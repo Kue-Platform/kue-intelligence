@@ -376,25 +376,35 @@ class SupabaseEntityStore(EntityStore):
                         entity_id_map[c.source_event_id] = eid
                         total_created += 1
 
-            # ── 3. Update existing entities (per-row PATCH) ────────────────────
-            for c in existing_candidates:
-                entity_id = entity_id_map.get(c.source_event_id)
-                if not entity_id:
-                    continue
-                httpx.patch(
-                    self._url("entities"),
-                    headers=self._base_headers,
-                    params={"entity_id": f"eq.{entity_id}"},
-                    json={
+            # ── 3. Bulk-update existing entities (1 POST upsert on entity_id) ───
+            # PostgREST merge-duplicates on entity_id lets us send all updates in one request.
+            if existing_candidates:
+                update_rows = [
+                    {
+                        "entity_id": entity_id_map[c.source_event_id],
+                        "tenant_id": c.tenant_id,
                         "display_name": c.display_name,
                         "primary_email": c.primary_email,
                         "company_norm": c.company_norm,
                         "title_norm": c.title_norm,
                         "metadata_json": c.metadata_json,
-                    },
-                    timeout=20.0,
-                )
-                total_updated += 1
+                    }
+                    for c in existing_candidates
+                    if entity_id_map.get(c.source_event_id)
+                ]
+                if update_rows:
+                    upd_resp = httpx.post(
+                        self._url("entities"),
+                        headers=self._upsert_headers,
+                        params={"on_conflict": "entity_id"},
+                        json=update_rows,
+                        timeout=30.0,
+                    )
+                    if upd_resp.status_code >= 400:
+                        raise RuntimeError(
+                            f"Supabase entities bulk update failed ({upd_resp.status_code}): {upd_resp.text}"
+                        )
+                    total_updated += len(update_rows)
 
             # ── 4. Native upsert all entity_identities (1 POST) ───────────────
             # on_conflict=(tenant_id,source,source_identity) → merge-duplicates
@@ -463,33 +473,38 @@ class SupabaseEntityStore(EntityStore):
                 row["primary_email"]: row for row in existing_resp.json()
             }
 
-            # ── 2. PATCH each matched entity ───────────────────────────────────
+            # ── 2. Bulk-update matched entities (1 POST upsert on entity_id) ────
+            # Merge existing metadata server-side and send all rows in one request.
+            update_rows = []
             for item in items:
                 existing = existing_by_email.get(item.primary_email)
                 if not existing:
                     continue
                 merged_metadata = dict(existing.get("metadata_json") or {})
                 merged_metadata.update(item.metadata_json)
-                patch = httpx.patch(
+                update_rows.append({
+                    "entity_id": existing["entity_id"],
+                    "display_name": item.display_name,
+                    "company_norm": item.metadata_json.get("company_norm"),
+                    "title_norm": item.metadata_json.get("title_norm"),
+                    "metadata_json": merged_metadata,
+                })
+
+            if update_rows:
+                bulk_resp = httpx.post(
                     self._url("entities"),
-                    headers=self._base_headers,
-                    params={"entity_id": f"eq.{existing['entity_id']}"},
-                    json={
-                        "display_name": item.display_name,
-                        "company_norm": item.metadata_json.get("company_norm"),
-                        "title_norm": item.metadata_json.get("title_norm"),
-                        "metadata_json": merged_metadata,
-                    },
-                    timeout=20.0,
+                    headers=self._upsert_headers,
+                    params={"on_conflict": "entity_id"},
+                    json=update_rows,
+                    timeout=30.0,
                 )
-                if patch.status_code >= 400:
+                if bulk_resp.status_code >= 400:
                     raise RuntimeError(
-                        f"Supabase entities metadata update failed ({patch.status_code}): {patch.text}"
+                        f"Supabase entities metadata bulk update failed ({bulk_resp.status_code}): {bulk_resp.text}"
                     )
-                updated += 1
+                updated += len(update_rows)
 
         return updated
-
 
 
 def create_entity_store(settings: Settings) -> EntityStore:
