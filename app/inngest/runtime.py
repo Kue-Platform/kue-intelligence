@@ -443,7 +443,8 @@ def _build_signals(embedding_vectors: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict[str, Any]:
-    """Fetch + parse + validate + enrich + persist canonical + all enrichment transforms.
+    """Fetch + parse + validate + enrich + persist canonical + all enrichment transforms
+    collapsed into one step.
 
     Large intermediate results (enrichment slices) are written to the StepPayloadStore
     so they never appear in the Inngest step return value, keeping it well under 256 KB.
@@ -506,29 +507,6 @@ def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict
         "relationship_count":     process["relationship_count"],
     }
 
-
-def _post_embedding_process(embedding_vectors: dict[str, Any]) -> dict[str, Any]:
-    """Cache store + cache metrics + build hybrid signals — all pure Python.
-
-    Loads vectors from the StepPayloadStore via vectors_ref so the large float
-    arrays never appear as an Inngest step argument.
-    """
-    vectors_ref = str(embedding_vectors.get("vectors_ref", ""))
-    if vectors_ref:
-        vectors_data = _step_payload_store().read(vectors_ref)
-    else:
-        vectors_data = embedding_vectors
-    cache_stored = _embedding_cache_store(vectors_data)
-    # write_embedding_cache is intentionally a no-op (in-memory cache resets per step)
-    signals = build_hybrid_signals(vectors_data).model_dump(mode="json")
-    metrics = _cache_metrics_snapshot()
-    return {
-        "cache_store_count": cache_stored.get("cache_store_count", 0),
-        "cached_count": 0,       # write_embedding_cache no-op
-        "stats": metrics.get("stats", {}),
-        "signals": signals.get("signals", []),
-        "signal_count": signals.get("signal_count", 0),
-    }
 
 
 def _project_graph(prepare_result: dict[str, Any]) -> dict[str, Any]:
@@ -735,14 +713,12 @@ def _run_layer_internal(
             result = _persist_metadata(dict(payload["metadata_result"]))
         elif op == "persist_semantic_documents":
             result = _persist_semantic_documents(dict(payload["semantic_result"]))
-        elif op == "embedding_cache_lookup":
-            result = _embedding_cache_lookup(dict(payload["semantic_result"]))
         elif op == "embedding_generate":
-            result = _generate_embedding_vectors(dict(payload["cache_lookup_result"]))
+            result = _generate_embedding_vectors(dict(payload["semantic_result"]))
         elif op == "embedding_persist":
             result = _persist_embeddings(dict(payload["vectors_result"]))
-        elif op == "post_embedding_process":
-            result = _post_embedding_process(dict(payload["vectors_result"]))
+        elif op == "build_signals":
+            result = _build_signals(dict(payload["embedding_vectors"]))
         elif op == "persist_search_index":
             result = _persist_search_index(dict(payload["signals_result"]))
         elif op == "graph_prepare":
@@ -1080,7 +1056,6 @@ async def _run_pipeline_core(
         )
         # Load enrichment slices from SPS — offloaded by _ingest_and_process to stay < 256 KB.
         enrichment_slices = _step_payload_store().read(ingest_result["enrichment_ref"])
-        # Thread run_id into semantic_result so _embedding_cache_lookup builds the correct SPS key
         semantic_result_with_run_id = {**enrichment_slices["semantic_result"], "run_id": run_id}
 
         entity_persist = await ctx.step.run(
