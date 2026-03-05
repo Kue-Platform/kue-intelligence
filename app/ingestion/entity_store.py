@@ -311,7 +311,7 @@ class SupabaseEntityStore(EntityStore):
             headers=self._base_headers,
             params={
                 "tenant_id": f"eq.{tenant_id}",
-                "primary_email": f"in.({','.join(emails)})",
+                "primary_email": 'in.("' + '","'.join(emails) + '")',
                 "select": "primary_email,entity_id",
             },
             timeout=30.0,
@@ -460,7 +460,7 @@ class SupabaseEntityStore(EntityStore):
                 headers=self._base_headers,
                 params={
                     "tenant_id": f"eq.{tenant_id}",
-                    "primary_email": f"in.({','.join(emails)})",
+                    "primary_email": 'in.("' + '","'.join(emails) + '")',
                     "select": "entity_id,primary_email,metadata_json",
                 },
                 timeout=30.0,

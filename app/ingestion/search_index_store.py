@@ -182,7 +182,7 @@ class SupabaseSearchIndexStore(SearchIndexStore):
             headers=self._base_headers,
             params={
                 "tenant_id": f"eq.{tenant_id}",
-                "primary_email": f"in.({','.join(emails)})",
+                "primary_email": 'in.("' + '","'.join(emails) + '")',
                 "select": "primary_email,entity_id",
             },
             timeout=30.0,
@@ -226,7 +226,7 @@ class SupabaseSearchIndexStore(SearchIndexStore):
                 headers=self._base_headers,
                 params={
                     "tenant_id": f"eq.{tenant_id}",
-                    "entity_id": f"in.({','.join(entity_ids)})",
+                    "entity_id": 'in.("' + '","'.join(entity_ids) + '")',
                     "select": "id,entity_id,doc_type,content,metadata_json",
                 },
                 timeout=30.0,
