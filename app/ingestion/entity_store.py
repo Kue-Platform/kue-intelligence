@@ -481,22 +481,32 @@ class SupabaseEntityStore(EntityStore):
                 existing_by_email.update({row["primary_email"]: row for row in existing_resp.json()})
 
             # ── 2. Bulk-update matched entities (1 POST upsert on entity_id) ────
-            # Merge existing metadata server-side and send all rows in one request.
-            update_rows = []
+            # Deduplicate by entity_id: same entity may appear from multiple sources
+            # (contacts + gmail + calendar). Postgres raises PG21000 if the same
+            # entity_id appears twice in one ON CONFLICT DO UPDATE batch.
+            deduped: dict[str, dict] = {}
             for item in items:
                 existing = existing_by_email.get(item.primary_email)
                 if not existing:
                     continue
-                merged_metadata = dict(existing.get("metadata_json") or {})
-                merged_metadata.update(item.metadata_json)
-                update_rows.append({
-                    "entity_id": existing["entity_id"],
-                    "tenant_id": tenant_id,
-                    "display_name": item.display_name,
-                    "company_norm": item.metadata_json.get("company_norm"),
-                    "title_norm": item.metadata_json.get("title_norm"),
-                    "metadata_json": merged_metadata,
-                })
+                eid = str(existing["entity_id"])
+                if eid not in deduped:
+                    # Seed with the server-side metadata already on the row
+                    deduped[eid] = {
+                        "entity_id": eid,
+                        "tenant_id": tenant_id,
+                        "display_name": item.display_name,
+                        "company_norm": item.metadata_json.get("company_norm"),
+                        "title_norm": item.metadata_json.get("title_norm"),
+                        "metadata_json": dict(existing.get("metadata_json") or {}),
+                    }
+                # Layer on the new metadata (last write wins per key)
+                deduped[eid]["metadata_json"].update(item.metadata_json)
+                deduped[eid]["company_norm"] = item.metadata_json.get("company_norm") or deduped[eid]["company_norm"]
+                deduped[eid]["title_norm"] = item.metadata_json.get("title_norm") or deduped[eid]["title_norm"]
+                deduped[eid]["display_name"] = item.display_name or deduped[eid]["display_name"]
+
+            update_rows = list(deduped.values())
 
             if update_rows:
                 bulk_resp = httpx.post(
