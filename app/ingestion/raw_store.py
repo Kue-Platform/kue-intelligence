@@ -263,6 +263,9 @@ class SupabaseRawEventStore(RawEventStore):
                 raise RuntimeError(
                     f"Supabase raw event bulk upsert failed ({upsert_resp.status_code}): {upsert_resp.text}"
                 )
+            return RawCaptureResult(stored_count=len(payload), captured_at=captured_at)
+
+        return RawCaptureResult(stored_count=len(payload), captured_at=captured_at)
 
     def list_by_trace_id(self, trace_id: str) -> list[RawCapturedEvent]:
         params = {

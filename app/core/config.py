@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     raw_events_db_path: str = "data/raw_events.db"
     canonical_events_db_path: str = "data/canonical_events.db"
     pipeline_db_path: str = "data/pipeline.db"
+    step_payloads_db_path: str = "data/step_payloads.db"
     parser_version: str = "v1"
 
     supabase_url: str = ""
@@ -20,6 +21,7 @@ class Settings(BaseSettings):
     supabase_service_role_key: str = ""
     supabase_raw_events_table: str = "raw_events"
     supabase_canonical_events_table: str = "canonical_events"
+    supabase_step_payloads_table: str = "step_payloads"
 
     inngest_event_key: str = ""
     inngest_signing_key: str = ""

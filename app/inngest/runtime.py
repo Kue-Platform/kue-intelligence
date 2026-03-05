@@ -24,18 +24,16 @@ from app.ingestion.embeddings import (
     EmbeddingRequest,
     EmbeddingVectorRecord,
     build_embedding_requests,
-    embedding_cache_lookup,
-    embedding_cache_store,
     generate_embeddings,
 )
 from app.ingestion.embedding_store import create_embedding_store
-from app.ingestion.cache_registry import cache_registry
 from app.ingestion.search_indexing import build_hybrid_signals
 from app.ingestion.search_index_store import create_search_index_store
 from app.ingestion.google_connector import GoogleOAuthConnector, GoogleOAuthContext
 from app.ingestion.parsers import parse_raw_events
 from app.ingestion.pipeline_store import PipelineStore, create_pipeline_store
 from app.ingestion.raw_store import create_raw_event_store
+from app.ingestion.step_payload_store import StepPayloadStore, create_step_payload_store
 from app.ingestion.validators import validate_parsed_events
 from app.schemas import GoogleMockSourceType, IngestionSource, SourceEvent
 
@@ -59,6 +57,11 @@ inngest_client = inngest.Inngest(
 @lru_cache(maxsize=1)
 def _pipeline_store() -> PipelineStore:
     return create_pipeline_store(settings)
+
+
+@lru_cache(maxsize=1)
+def _step_payload_store() -> StepPayloadStore:
+    return create_step_payload_store(settings)
 
 
 async def _alert_on_failure(ctx: inngest.Context) -> None:
@@ -372,45 +375,44 @@ def _persist_semantic_documents(semantic_payload: dict[str, Any]) -> dict[str, A
     }
 
 
-def _embedding_cache_lookup(semantic_payload: dict[str, Any]) -> dict[str, Any]:
+def _generate_embedding_vectors(semantic_payload: dict[str, Any]) -> dict[str, Any]:
+    """Build embedding requests from semantic documents and generate vectors for all.
+
+    No cache lookup or cache store — all documents are embedded every run.
+    Vectors are written to the StepPayloadStore so the 1536-float arrays never
+    cross the Inngest serialization boundary.
+    """
+    run_id = str(semantic_payload.get("run_id", ""))
     requests = build_embedding_requests(semantic_payload)
-    lookup = embedding_cache_lookup(requests)
-    return lookup.model_dump(mode="json")
+    generated = generate_embeddings(requests)
 
+    # Write vectors to SPS — keeps step return value tiny
+    sps = _step_payload_store()
+    vectors_ref = sps.write(run_id, "embedding_generate", {
+        "records": [item.model_dump(mode="json") for item in generated.generated],
+    })
 
-def _generate_embedding_vectors(cache_lookup_payload: dict[str, Any]) -> dict[str, Any]:
-    misses = [
-        EmbeddingRequest.model_validate(item)
-        for item in list(cache_lookup_payload.get("misses", []))
-    ]
-    generated = generate_embeddings(misses)
-    hits = [
-        EmbeddingVectorRecord.model_validate(item)
-        for item in list(cache_lookup_payload.get("hits", []))
-    ]
-    all_records = hits + generated.generated
     return {
-        "candidate_count": int(cache_lookup_payload.get("candidate_count", 0)),
-        "cache_hit_count": int(cache_lookup_payload.get("cache_hit_count", 0)),
-        "cache_miss_count": int(cache_lookup_payload.get("cache_miss_count", 0)),
+        "run_id":          run_id,
         "generated_count": generated.generated_count,
-        "records": [item.model_dump(mode="json") for item in all_records],
+        "total_count":     generated.generated_count,
+        "vectors_ref":     vectors_ref,
     }
 
 
-def _embedding_cache_store(vectors_payload: dict[str, Any]) -> dict[str, Any]:
+def _persist_embeddings(vectors_ref_or_payload: dict[str, Any]) -> dict[str, Any]:
+    """Persist embedding vectors to the embedding store.
+
+    Loads vectors from the StepPayloadStore when a vectors_ref is present.
+    """
+    vectors_ref = str(vectors_ref_or_payload.get("vectors_ref", ""))
+    if vectors_ref:
+        vectors_data = _step_payload_store().read(vectors_ref)
+    else:
+        vectors_data = vectors_ref_or_payload
     records = [
         EmbeddingVectorRecord.model_validate(item)
-        for item in list(vectors_payload.get("records", []))
-    ]
-    stored = embedding_cache_store(records)
-    return {"cache_store_count": stored}
-
-
-def _persist_embeddings(vectors_payload: dict[str, Any]) -> dict[str, Any]:
-    records = [
-        EmbeddingVectorRecord.model_validate(item)
-        for item in list(vectors_payload.get("records", []))
+        for item in list(vectors_data.get("records", []))
     ]
     store = create_embedding_store(settings)
     result = store.persist_vectors(records)
@@ -421,75 +423,69 @@ def _persist_embeddings(vectors_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _cache_enrichment(enrichment_payload: dict[str, Any]) -> dict[str, Any]:
-    parsed_events = list(enrichment_payload.get("parsed_events", []))
-    cached = 0
-    for event in parsed_events:
-        source_event_id = str(event.get("source_event_id") or "").strip()
-        tenant_id = str(event.get("tenant_id") or "").strip()
-        if not source_event_id or not tenant_id:
-            continue
-        key = f"{tenant_id}:{source_event_id}"
-        cache_registry.put(
-            namespace="enrichment",
-            version="v1",
-            key=key,
-            value=dict(event),
-        )
-        cached += 1
-    return {"cached_count": cached}
+def _build_signals(embedding_vectors: dict[str, Any]) -> dict[str, Any]:
+    """Build hybrid search signals from embedding vectors.
 
-
-def _cache_embeddings(vectors_payload: dict[str, Any]) -> dict[str, Any]:
-    # TODO: Re-enable when Redis is introduced.
-    # The in-memory InMemoryCacheRegistry is reset on every Inngest step invocation
-    # (each step is a fresh process/worker), so writes here are immediately lost.
-    # Keeping the step registered so the pipeline chain stays intact.
-    del vectors_payload
-    return {"cached_count": 0}
-
-
-def _cache_metrics_snapshot() -> dict[str, Any]:
-    stats = cache_registry.stats()
-    return {"stats": stats}
+    Replaces the old _post_embedding_process which bundled cache_store +
+    cache_metrics + build_hybrid_signals. Cache ops have been removed entirely.
+    Vectors are loaded from SPS via vectors_ref.
+    """
+    vectors_ref = str(embedding_vectors.get("vectors_ref", ""))
+    if vectors_ref:
+        vectors_data = _step_payload_store().read(vectors_ref)
+    else:
+        vectors_data = embedding_vectors
+    signals = build_hybrid_signals(vectors_data).model_dump(mode="json")
+    return {
+        "signals": signals.get("signals", []),
+        "signal_count": signals.get("signal_count", 0),
+    }
 
 
 def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict[str, Any]:
     """Fetch + parse + validate + enrich + persist canonical + all enrichment transforms.
 
-    All previous steps in this chain returned the full enrichment_result (parsed events,
-    enriched events, etc.) as step output, which for Gmail/Calendar datasets exceeds
-    Inngest's 256 KB serialization limit.
-
-    This function consumes enrichment_result ENTIRELY INLINE — it never appears in the
-    return value. The output is only compact structured slices (model-dumped results)
-    plus summary counts. Typical output: <50 KB regardless of dataset size.
+    Large intermediate results (enrichment slices) are written to the StepPayloadStore
+    so they never appear in the Inngest step return value, keeping it well under 256 KB.
+    Only compact counts + a step_ref are returned across the step boundary.
     """
     # 1. Fetch raw events from store (1 DB read)
     raw = _fetch_raw_events(trace_id)
     raw_events = list(raw.get("events", []))
 
-    # 2. Parse → validate → enrich  (pure Python, enrichment_result stays local)
+    # 2. Parse → validate → enrich  (pure Python, large blobs stay local)
     parsed = _parse_raw_events(raw_events)
     validated = validate_parsed_events(dict(parsed)).model_dump(mode="json")
     enriched = clean_and_enrich_events(dict(validated)).model_dump(mode="json")
 
-    # 3. Persist canonical (DB write, was its own step — enrichment_result consumed here)
+    # 3. Persist canonical (DB write — consumed here, not returned)
     canonical = _persist_canonical(run_id, enriched, parser_version)
 
-    # 4. All enrichment transforms (pure Python, was its own step — enrichment_result consumed here)
+    # 4. All enrichment transforms (pure Python)
     process = _process_enrichment(enriched)
 
-    # Capture validation counts BEFORE deleting the large intermediate dicts
+    # Capture validation counts before dropping the large intermediate dicts
     valid_count = int(validated.get("valid_count", 0))
     invalid_count = int(validated.get("invalid_count", 0))
     invalid_events = list(validated.get("invalid_events", []))
 
-    # enrichment_result (the large blob) is now GC-able — never returned
+    # 5. Write the enrichment slices to StepPayloadStore — these are the large parts.
+    #    Downstream persist steps will read them from the store by step_ref.
+    sps = _step_payload_store()
+    enrichment_ref = sps.write(run_id, "ingest_and_process", {
+        "merge_result":    process["merge_result"],
+        "metadata_result": process["metadata_result"],
+        "semantic_result": process["semantic_result"],
+        "extract_result":  process["extract_result"],
+        "strength_result": process["strength_result"],
+    })
+
+    # Large blobs are now offloaded — safe to GC
     del enriched, validated
 
+    # Return ONLY compact counts + the step_ref (tiny, always < 1 KB)
     return {
-        # Summary counts (no event arrays)
+        # Counts for summary / pipeline tracking
         "raw_count":      raw.get("count", 0),
         "parsed_count":   parsed.get("parsed_count", 0),
         "failed_count":   parsed.get("failed_count", 0),
@@ -497,15 +493,11 @@ def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict
         "invalid_count":  invalid_count,
         "invalid_events": invalid_events,
         "enriched_count": process.get("entity_candidate_count", 0),
-        # canonical persist metadata (small)
+        # Canonical persist metadata (small)
         **canonical,
-        # Compact typed slices for downstream persist steps
-        "merge_result":    process["merge_result"],
-        "metadata_result": process["metadata_result"],
-        "semantic_result": process["semantic_result"],
-        "extract_result":  process["extract_result"],
-        "strength_result": process["strength_result"],
-        # Enrichment counts for summary
+        # Reference for downstream steps to load enrichment slices
+        "enrichment_ref": enrichment_ref,
+        # Enrichment counts for summary (scalars only)
         "entity_candidate_count": process["entity_candidate_count"],
         "resolved_count":         process["resolved_count"],
         "metadata_count":         process["metadata_count"],
@@ -515,15 +507,20 @@ def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict
     }
 
 
-def _post_embedding_process(vectors_payload: dict[str, Any]) -> dict[str, Any]:
-    """Group 2 collapse: cache_store + write_embedding_cache (no-op) + cache_metrics + build_hybrid_signals.
+def _post_embedding_process(embedding_vectors: dict[str, Any]) -> dict[str, Any]:
+    """Cache store + cache metrics + build hybrid signals — all pure Python.
 
-    All 4 are pure Python / in-memory. The embedding_vectors payload (1536-dim × N)
-    was being serialized 4 times for these steps. Now serialized once.
+    Loads vectors from the StepPayloadStore via vectors_ref so the large float
+    arrays never appear as an Inngest step argument.
     """
-    cache_stored = _embedding_cache_store(vectors_payload)
+    vectors_ref = str(embedding_vectors.get("vectors_ref", ""))
+    if vectors_ref:
+        vectors_data = _step_payload_store().read(vectors_ref)
+    else:
+        vectors_data = embedding_vectors
+    cache_stored = _embedding_cache_store(vectors_data)
     # write_embedding_cache is intentionally a no-op (in-memory cache resets per step)
-    signals = build_hybrid_signals(vectors_payload).model_dump(mode="json")
+    signals = build_hybrid_signals(vectors_data).model_dump(mode="json")
     metrics = _cache_metrics_snapshot()
     return {
         "cache_store_count": cache_stored.get("cache_store_count", 0),
@@ -919,47 +916,27 @@ def _layer_persist_semantic_documents(run_id: str, semantic_result: dict[str, An
     )
 
 
-def _layer_embedding_cache_lookup(run_id: str, semantic_result: dict[str, Any]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="embedding",
-        layer_key="cache_lookup",
-        records_in=int(semantic_result.get("document_count", 0)),
-        op="embedding_cache_lookup",
-        payload={"semantic_result": semantic_result},
-    )
-
-
-def _layer_embedding_generate(run_id: str, cache_lookup_result: dict[str, Any]) -> dict[str, Any]:
+def _layer_embedding_generate(run_id: str, semantic_result: dict[str, Any]) -> dict[str, Any]:
+    """Generate embeddings for all semantic documents (no cache lookup)."""
     return _run_layer_internal(
         run_id=run_id,
         stage_key="embedding",
         layer_key="generate_vectors",
-        records_in=int(cache_lookup_result.get("cache_miss_count", 0)),
+        records_in=int(semantic_result.get("document_count", 0)),
         op="embedding_generate",
-        payload={"cache_lookup_result": cache_lookup_result},
+        payload={"semantic_result": semantic_result},
     )
 
 
-def _layer_embedding_cache_store(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
+def _layer_build_signals(run_id: str, embedding_vectors: dict[str, Any]) -> dict[str, Any]:
+    """Build hybrid search signals from embedding vectors."""
     return _run_layer_internal(
         run_id=run_id,
-        stage_key="embedding",
-        layer_key="cache_store",
-        records_in=int(vectors_result.get("generated_count", 0)),
-        op="embedding_cache_store",
-        payload={"vectors_result": vectors_result},
-    )
-
-
-def _layer_post_embedding_process(run_id: str, vectors_result: dict[str, Any]) -> dict[str, Any]:
-    return _run_layer_internal(
-        run_id=run_id,
-        stage_key="embedding",
-        layer_key="post_process",
-        records_in=int(vectors_result.get("generated_count", 0)),
-        op="post_embedding_process",
-        payload={"vectors_result": vectors_result},
+        stage_key="search_indexing",
+        layer_key="build_signals",
+        records_in=int(embedding_vectors.get("generated_count", 0)),
+        op="build_signals",
+        payload={"embedding_vectors": embedding_vectors},
     )
 
 
@@ -1101,35 +1078,34 @@ async def _run_pipeline_core(
             trace_id,
             parser_version,
         )
+        # Load enrichment slices from SPS — offloaded by _ingest_and_process to stay < 256 KB.
+        enrichment_slices = _step_payload_store().read(ingest_result["enrichment_ref"])
+        # Thread run_id into semantic_result so _embedding_cache_lookup builds the correct SPS key
+        semantic_result_with_run_id = {**enrichment_slices["semantic_result"], "run_id": run_id}
+
         entity_persist = await ctx.step.run(
             "stage.entity_resolution.layer.persist_entities",
             _layer_entity_persist,
             run_id,
-            ingest_result["merge_result"],
+            enrichment_slices["merge_result"],
         )
         metadata_persist = await ctx.step.run(
             "stage.metadata_extraction.layer.persist_metadata",
             _layer_persist_metadata,
             run_id,
-            ingest_result["metadata_result"],
+            enrichment_slices["metadata_result"],
         )
         semantic_persist = await ctx.step.run(
             "stage.semantic_prep.layer.persist_search_documents",
             _layer_persist_semantic_documents,
             run_id,
-            ingest_result["semantic_result"],
-        )
-        embedding_lookup = await ctx.step.run(
-            "stage.embedding.layer.cache_lookup",
-            _layer_embedding_cache_lookup,
-            run_id,
-            ingest_result["semantic_result"],
+            enrichment_slices["semantic_result"],
         )
         embedding_vectors = await ctx.step.run(
             "stage.embedding.layer.generate_vectors",
             _layer_embedding_generate,
             run_id,
-            embedding_lookup,
+            semantic_result_with_run_id,
         )
         embedding_persist = await ctx.step.run(
             "stage.embedding.layer.persist_vectors",
@@ -1137,9 +1113,9 @@ async def _run_pipeline_core(
             run_id,
             embedding_vectors,
         )
-        post_result = await ctx.step.run(
-            "stage.embedding.layer.post_process",
-            _layer_post_embedding_process,
+        signals_result = await ctx.step.run(
+            "stage.search_indexing.layer.build_signals",
+            _layer_build_signals,
             run_id,
             embedding_vectors,
         )
@@ -1147,15 +1123,16 @@ async def _run_pipeline_core(
             "stage.search_indexing.layer.index_health_check",
             _layer_persist_search_index,
             run_id,
-            post_result,
+            signals_result,
         )
         relationship_persist = await ctx.step.run(
             "stage.relationship_extraction.layer.persist_relationships",
             _layer_persist_relationships,
             run_id,
-            ingest_result["extract_result"],
-            ingest_result["strength_result"],
+            enrichment_slices["extract_result"],
+            enrichment_slices["strength_result"],
         )
+
         graph_prepare = await ctx.step.run(
             "stage.graph_projection.layer.prepare",
             _layer_graph_prepare,
@@ -1213,18 +1190,11 @@ async def _run_pipeline_core(
                 **semantic_persist,
             },
             "embedding": {
-                "cache_hit_count": embedding_lookup.get("cache_hit_count", 0),
-                "cache_miss_count": embedding_lookup.get("cache_miss_count", 0),
                 "generated_count": embedding_vectors.get("generated_count", 0),
-                "cache_store_count": post_result.get("cache_store_count", 0),
                 **embedding_persist,
             },
-            "caching": {
-                "embedding_cached_count": post_result.get("cached_count", 0),
-                "stats": post_result.get("stats", {}),
-            },
             "search_indexing": {
-                "signal_count": post_result.get("signal_count", 0),
+                "signal_count": signals_result.get("signal_count", 0),
                 **search_index_result,
             },
             "relationship_extraction": {
@@ -1352,35 +1322,33 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             trace_id,
             parser_version,
         )
+        # Load enrichment slices from SPS — offloaded by _ingest_and_process to stay < 256 KB.
+        enrichment_slices = _step_payload_store().read(ingest_result["enrichment_ref"])
+        semantic_result_with_run_id = {**enrichment_slices["semantic_result"], "run_id": run_id}
+
         entity_persist = await ctx.step.run(
             "stage.entity_resolution.layer.persist_entities",
             _layer_entity_persist,
             run_id,
-            ingest_result["merge_result"],
+            enrichment_slices["merge_result"],
         )
         metadata_persist = await ctx.step.run(
             "stage.metadata_extraction.layer.persist_metadata",
             _layer_persist_metadata,
             run_id,
-            ingest_result["metadata_result"],
+            enrichment_slices["metadata_result"],
         )
         semantic_persist = await ctx.step.run(
             "stage.semantic_prep.layer.persist_search_documents",
             _layer_persist_semantic_documents,
             run_id,
-            ingest_result["semantic_result"],
-        )
-        embedding_lookup = await ctx.step.run(
-            "stage.embedding.layer.cache_lookup",
-            _layer_embedding_cache_lookup,
-            run_id,
-            ingest_result["semantic_result"],
+            enrichment_slices["semantic_result"],
         )
         embedding_vectors = await ctx.step.run(
             "stage.embedding.layer.generate_vectors",
             _layer_embedding_generate,
             run_id,
-            embedding_lookup,
+            semantic_result_with_run_id,
         )
         embedding_persist = await ctx.step.run(
             "stage.embedding.layer.persist_vectors",
@@ -1388,9 +1356,9 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             run_id,
             embedding_vectors,
         )
-        post_result = await ctx.step.run(
-            "stage.embedding.layer.post_process",
-            _layer_post_embedding_process,
+        signals_result = await ctx.step.run(
+            "stage.search_indexing.layer.build_signals",
+            _layer_build_signals,
             run_id,
             embedding_vectors,
         )
@@ -1398,15 +1366,16 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             "stage.search_indexing.layer.index_health_check",
             _layer_persist_search_index,
             run_id,
-            post_result,
+            signals_result,
         )
         relationship_persist = await ctx.step.run(
             "stage.relationship_extraction.layer.persist_relationships",
             _layer_persist_relationships,
             run_id,
-            ingest_result["extract_result"],
-            ingest_result["strength_result"],
+            enrichment_slices["extract_result"],
+            enrichment_slices["strength_result"],
         )
+
         graph_prepare = await ctx.step.run(
             "stage.graph_projection.layer.prepare",
             _layer_graph_prepare,
@@ -1459,18 +1428,11 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
                 **semantic_persist,
             },
             "embedding": {
-                "cache_hit_count": embedding_lookup.get("cache_hit_count", 0),
-                "cache_miss_count": embedding_lookup.get("cache_miss_count", 0),
                 "generated_count": embedding_vectors.get("generated_count", 0),
-                "cache_store_count": post_result.get("cache_store_count", 0),
                 **embedding_persist,
             },
-            "caching": {
-                "embedding_cached_count": post_result.get("cached_count", 0),
-                "stats": post_result.get("stats", {}),
-            },
             "search_indexing": {
-                "signal_count": post_result.get("signal_count", 0),
+                "signal_count": signals_result.get("signal_count", 0),
                 **search_index_result,
             },
             "relationship_extraction": {

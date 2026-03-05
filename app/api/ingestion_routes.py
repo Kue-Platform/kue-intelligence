@@ -346,7 +346,7 @@ async def google_oauth_callback_mock(
         user_id=resolved_user_id,
         trace_id=trace_id,
         source_events=[],
-        counts={"source_events": len(source_events)},
+        counts={},
         pipeline_event_name="kue/user.mock_connected",
         pipeline_event_id=event_id,
         pipeline_status="accepted",
