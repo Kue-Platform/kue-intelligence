@@ -306,21 +306,26 @@ class SupabaseEntityStore(EntityStore):
         """Return {primary_email -> entity_id} for all known emails in one GET."""
         if not emails:
             return {}
-        response = httpx.get(
-            self._url("entities"),
-            headers=self._base_headers,
-            params={
-                "tenant_id": f"eq.{tenant_id}",
-                "primary_email": 'in.("' + '","'.join(emails) + '")',
-                "select": "primary_email,entity_id",
-            },
-            timeout=30.0,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Supabase entities bulk fetch failed ({response.status_code}): {response.text}"
+        unique_emails = list(set(emails))
+        result: dict[str, str] = {}
+        for i in range(0, len(unique_emails), 50):
+            chunk = unique_emails[i:i + 50]
+            response = httpx.get(
+                self._url("entities"),
+                headers=self._base_headers,
+                params={
+                    "tenant_id": f"eq.{tenant_id}",
+                    "primary_email": 'in.("' + '","'.join(chunk) + '")',
+                    "select": "primary_email,entity_id",
+                },
+                timeout=30.0,
             )
-        return {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase entities bulk fetch failed ({response.status_code}): {response.text}"
+                )
+            result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
+        return result
 
     def upsert_entities(self, resolved_entities: list[EntityCandidate]) -> EntityPersistResult:
         if not resolved_entities:
@@ -454,24 +459,26 @@ class SupabaseEntityStore(EntityStore):
         for tenant_id, items in by_tenant.items():
             emails = [item.primary_email for item in items]
 
-            # ── 1. Bulk-fetch all matching entities in one GET ─────────────────
-            existing_resp = httpx.get(
-                self._url("entities"),
-                headers=self._base_headers,
-                params={
-                    "tenant_id": f"eq.{tenant_id}",
-                    "primary_email": 'in.("' + '","'.join(emails) + '")',
-                    "select": "entity_id,primary_email,metadata_json",
-                },
-                timeout=30.0,
-            )
-            if existing_resp.status_code >= 400:
-                raise RuntimeError(
-                    f"Supabase entities metadata bulk fetch failed ({existing_resp.status_code}): {existing_resp.text}"
+            # ── 1. Bulk-fetch all matching entities in batched GETs ────────────
+            unique_emails = list(set(emails))
+            existing_by_email: dict[str, dict] = {}
+            for i in range(0, len(unique_emails), 50):
+                chunk = unique_emails[i:i + 50]
+                existing_resp = httpx.get(
+                    self._url("entities"),
+                    headers=self._base_headers,
+                    params={
+                        "tenant_id": f"eq.{tenant_id}",
+                        "primary_email": 'in.("' + '","'.join(chunk) + '")',
+                        "select": "entity_id,primary_email,metadata_json",
+                    },
+                    timeout=30.0,
                 )
-            existing_by_email: dict[str, dict] = {
-                row["primary_email"]: row for row in existing_resp.json()
-            }
+                if existing_resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"Supabase entities metadata bulk fetch failed ({existing_resp.status_code}): {existing_resp.text}"
+                    )
+                existing_by_email.update({row["primary_email"]: row for row in existing_resp.json()})
 
             # ── 2. Bulk-update matched entities (1 POST upsert on entity_id) ────
             # Merge existing metadata server-side and send all rows in one request.

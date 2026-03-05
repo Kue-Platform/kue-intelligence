@@ -137,21 +137,26 @@ class SupabaseEmbeddingStore(EmbeddingStore):
         """Return {primary_email -> entity_id} for all given emails in one GET."""
         if not emails:
             return {}
-        response = httpx.get(
-            self._url("entities"),
-            headers=self._base_headers,
-            params={
-                "tenant_id": f"eq.{tenant_id}",
-                "primary_email": 'in.("' + '","'.join(emails) + '")',
-                "select": "primary_email,entity_id",
-            },
-            timeout=30.0,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Supabase entity bulk lookup for embeddings failed ({response.status_code}): {response.text}"
+        unique_emails = list(set(emails))
+        result: dict[str, str] = {}
+        for i in range(0, len(unique_emails), 50):
+            chunk = unique_emails[i:i + 50]
+            response = httpx.get(
+                self._url("entities"),
+                headers=self._base_headers,
+                params={
+                    "tenant_id": f"eq.{tenant_id}",
+                    "primary_email": 'in.("' + '","'.join(chunk) + '")',
+                    "select": "primary_email,entity_id",
+                },
+                timeout=30.0,
             )
-        return {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase entity bulk lookup for embeddings failed ({response.status_code}): {response.text}"
+                )
+            result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
+        return result
 
     def persist_vectors(self, records: list[EmbeddingVectorRecord]) -> EmbeddingPersistResult:
         if not records:

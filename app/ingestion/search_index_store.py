@@ -177,21 +177,26 @@ class SupabaseSearchIndexStore(SearchIndexStore):
         """Return {primary_email -> entity_id} for all given emails in one GET."""
         if not emails:
             return {}
-        response = httpx.get(
-            self._url("entities"),
-            headers=self._base_headers,
-            params={
-                "tenant_id": f"eq.{tenant_id}",
-                "primary_email": 'in.("' + '","'.join(emails) + '")',
-                "select": "primary_email,entity_id",
-            },
-            timeout=30.0,
-        )
-        if response.status_code >= 400:
-            raise RuntimeError(
-                f"Supabase entity bulk lookup for indexing failed ({response.status_code}): {response.text}"
+        unique_emails = list(set(emails))
+        result: dict[str, str] = {}
+        for i in range(0, len(unique_emails), 50):
+            chunk = unique_emails[i:i + 50]
+            response = httpx.get(
+                self._url("entities"),
+                headers=self._base_headers,
+                params={
+                    "tenant_id": f"eq.{tenant_id}",
+                    "primary_email": 'in.("' + '","'.join(chunk) + '")',
+                    "select": "primary_email,entity_id",
+                },
+                timeout=30.0,
             )
-        return {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
+            if response.status_code >= 400:
+                raise RuntimeError(
+                    f"Supabase entity bulk lookup for indexing failed ({response.status_code}): {response.text}"
+                )
+            result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
+        return result
 
     def apply_hybrid_signals(self, signals: list[HybridSignal]) -> SearchIndexPersistResult:
         if not signals:
@@ -220,26 +225,27 @@ class SupabaseSearchIndexStore(SearchIndexStore):
                 skipped += len(valid)
                 continue
 
-            # ── 2. Bulk-fetch all matching search_documents (1 GET per tenant) ──
-            doc_resp = httpx.get(
-                self._url("search_documents"),
-                headers=self._base_headers,
-                params={
-                    "tenant_id": f"eq.{tenant_id}",
-                    "entity_id": 'in.("' + '","'.join(entity_ids) + '")',
-                    "select": "id,entity_id,doc_type,content,metadata_json",
-                },
-                timeout=30.0,
-            )
-            if doc_resp.status_code >= 400:
-                raise RuntimeError(
-                    f"Supabase search_documents bulk fetch failed ({doc_resp.status_code}): {doc_resp.text}"
-                )
-            # Build lookup: (entity_id, doc_type, content) -> row
+            # ── 2. Bulk-fetch all matching search_documents (chunked) ───────────
             doc_by_key: dict[tuple[str, str, str], dict] = {}
-            for row in doc_resp.json():
-                key = (str(row["entity_id"]), str(row["doc_type"]), str(row["content"]))
-                doc_by_key[key] = row
+            for i in range(0, len(entity_ids), 50):
+                chunk = entity_ids[i:i + 50]
+                doc_resp = httpx.get(
+                    self._url("search_documents"),
+                    headers=self._base_headers,
+                    params={
+                        "tenant_id": f"eq.{tenant_id}",
+                        "entity_id": 'in.("' + '","'.join(chunk) + '")',
+                        "select": "id,entity_id,doc_type,content,metadata_json",
+                    },
+                    timeout=30.0,
+                )
+                if doc_resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"Supabase search_documents bulk fetch failed ({doc_resp.status_code}): {doc_resp.text}"
+                    )
+                for row in doc_resp.json():
+                    key = (str(row["entity_id"]), str(row["doc_type"]), str(row["content"]))
+                    doc_by_key[key] = row
 
             # ── 3. Bulk-update metadata on matched docs (1 POST upsert per tenant) ─
             # Previous code: per-doc PATCH loop (N calls for N matched documents).
