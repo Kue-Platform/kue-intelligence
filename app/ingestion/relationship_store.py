@@ -241,14 +241,16 @@ class SupabaseRelationshipStore(RelationshipStore):
             all_emails = list({email for rel in rels for email in (rel.from_email, rel.to_email)})
             email_to_id = self._bulk_resolve_entity_ids(tenant_id, all_emails)
 
-            # Build rows — skip pairs where either entity is not yet resolved
-            rows: list[dict] = []
+            # Build rows — deduplicate on (tenant_id, from, to, type) which is the
+            # ON CONFLICT key. Same pair may appear from Gmail + Calendar interactions.
+            deduped_rels: dict[tuple, dict] = {}
             for rel in rels:
                 from_id = email_to_id.get(rel.from_email)
                 to_id = email_to_id.get(rel.to_email)
                 if not from_id or not to_id:
                     continue
-                rows.append({
+                key = (rel.tenant_id, from_id, to_id, rel.relationship_type)
+                deduped_rels[key] = {
                     "tenant_id": rel.tenant_id,
                     "from_entity_id": from_id,
                     "to_entity_id": to_id,
@@ -258,7 +260,8 @@ class SupabaseRelationshipStore(RelationshipStore):
                     "last_interaction_at": rel.last_interaction_at,
                     "interaction_count": rel.interaction_count,
                     "evidence_json": rel.evidence_json,
-                })
+                }
+            rows = list(deduped_rels.values())
 
             if not rows:
                 continue

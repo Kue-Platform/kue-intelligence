@@ -248,9 +248,9 @@ class SupabaseSearchIndexStore(SearchIndexStore):
                     doc_by_key[key] = row
 
             # ── 3. Bulk-update metadata on matched docs (1 POST upsert per tenant) ─
-            # Previous code: per-doc PATCH loop (N calls for N matched documents).
-            # Fix: collect all updates then send as a single merge-duplicates upsert on id.
-            update_rows: list[dict] = []
+            # Deduplicate by `id` — same doc can match multiple signals (same entity,
+            # different source types). Postgres raises PG21000 if id appears twice.
+            deduped_updates: dict[str, dict] = {}
             for signal in valid:
                 entity_id = email_to_id.get(signal.primary_email)
                 if not entity_id:
@@ -261,18 +261,21 @@ class SupabaseSearchIndexStore(SearchIndexStore):
                 if not row:
                     skipped += 1
                     continue
-                metadata = dict(row.get("metadata_json") or {})
+                doc_id = str(row["id"])
+                existing = deduped_updates.get(doc_id)
+                metadata = dict((existing or row).get("metadata_json") or {})
                 metadata["hybrid_keywords"] = signal.keywords
                 metadata["embedding_ready"] = signal.embedding_ready
                 metadata["indexed"] = True
-                update_rows.append({
-                    "id": row["id"],
+                deduped_updates[doc_id] = {
+                    "id": doc_id,
                     "tenant_id": tenant_id,
                     "entity_id": entity_id,
                     "doc_type": signal.doc_type,
                     "content": signal.content,
                     "metadata_json": metadata,
-                })
+                }
+            update_rows = list(deduped_updates.values())
 
             if update_rows:
                 bulk_patch = httpx.post(

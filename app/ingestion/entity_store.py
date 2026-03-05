@@ -382,11 +382,17 @@ class SupabaseEntityStore(EntityStore):
                         total_created += 1
 
             # ── 3. Bulk-update existing entities (1 POST upsert on entity_id) ───
-            # PostgREST merge-duplicates on entity_id lets us send all updates in one request.
+            # Deduplicate by entity_id: multiple candidates can map to the same entity
+            # (e.g. same contact in Gmail + calendar). Postgres raises PG21000 if
+            # entity_id appears twice in one ON CONFLICT DO UPDATE batch.
             if existing_candidates:
-                update_rows = [
-                    {
-                        "entity_id": entity_id_map[c.source_event_id],
+                deduped_entities: dict[str, dict] = {}
+                for c in existing_candidates:
+                    eid = entity_id_map.get(c.source_event_id)
+                    if not eid:
+                        continue
+                    deduped_entities[eid] = {
+                        "entity_id": eid,
                         "tenant_id": c.tenant_id,
                         "display_name": c.display_name,
                         "primary_email": c.primary_email,
@@ -394,9 +400,8 @@ class SupabaseEntityStore(EntityStore):
                         "title_norm": c.title_norm,
                         "metadata_json": c.metadata_json,
                     }
-                    for c in existing_candidates
-                    if entity_id_map.get(c.source_event_id)
-                ]
+                update_rows = list(deduped_entities.values())
+
                 if update_rows:
                     upd_resp = httpx.post(
                         self._url("entities"),

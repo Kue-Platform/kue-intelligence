@@ -283,9 +283,12 @@ class SupabaseCanonicalEventStore(CanonicalEventStore):
                 raise RuntimeError(
                     f"Supabase canonical event insert failed ({response.status_code}): {response.text}"
                 )
-            # Conflict fallback: bulk upsert with merge-duplicates on the unique key.
-            # Previous code: per-row for loop with GET+PATCH/POST per canonical event.
-            # That was N × 2 Supabase calls for 548 events on a repeat run.
+            # Conflict fallback: deduplicate on unique key before bulk upsert to
+            # avoid PG21000 if parsed_events contains duplicate (raw_event_id, event_type, parser_version).
+            deduped: dict[tuple, dict] = {
+                (row["raw_event_id"], row["event_type"], row["parser_version"]): row
+                for row in payload
+            }
             upsert_resp = httpx.post(
                 self._rest_url(),
                 headers={
@@ -293,7 +296,7 @@ class SupabaseCanonicalEventStore(CanonicalEventStore):
                     "Prefer": "resolution=merge-duplicates,return=minimal",
                 },
                 params={"on_conflict": "raw_event_id,event_type,parser_version"},
-                json=payload,
+                json=list(deduped.values()),
                 timeout=30.0,
             )
             if upsert_resp.status_code >= 400:

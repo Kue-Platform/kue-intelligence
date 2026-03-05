@@ -462,7 +462,8 @@ class GraphProjectionService:
                 f"Supabase graph_projection_runs upsert failed ({run_resp.status_code}): {run_resp.text}"
             )
 
-        node_rows: list[dict[str, Any]] = []
+        # Deduplicate on (tenant_id, node_label, node_key) — the ON CONFLICT key.
+        deduped_nodes: dict[tuple, dict] = {}
         for label, rows in (
             ("Person", list(snapshot.get("persons", []))),
             ("User", list(snapshot.get("users", []))),
@@ -476,32 +477,33 @@ class GraphProjectionService:
                 "Topic": "topic_id",
             }[label]
             for row in rows:
-                key = str(row.get(key_name) or "")
-                if not key:
+                node_key = str(row.get(key_name) or "")
+                if not node_key:
                     continue
                 row_hash = hashlib.sha256(
                     json.dumps(row, sort_keys=True, default=str).encode("utf-8")
                 ).hexdigest()
-                node_rows.append(
-                    {
-                        "run_id": run_id,
-                        "tenant_id": tenant_id,
-                        "node_label": label,
-                        "node_key": key,
-                        "node_hash": row_hash,
-                        "projected_at": _utc_now_iso(),
-                    }
-                )
+                deduped_nodes[(tenant_id, label, node_key)] = {
+                    "run_id": run_id,
+                    "tenant_id": tenant_id,
+                    "node_label": label,
+                    "node_key": node_key,
+                    "node_hash": row_hash,
+                    "projected_at": _utc_now_iso(),
+                }
 
-        edge_rows: list[dict[str, Any]] = []
+        node_rows = list(deduped_nodes.values())
+
+        # Deduplicate on (tenant_id, edge_type, edge_key) — the ON CONFLICT key.
         edge_configs = [
             ("KNOWS", "knows_edges", lambda r: f"{r.get('from_entity_id')}->{r.get('to_entity_id')}:{r.get('relationship_type') or 'direct'}"),
-            ("INTERACTED_WITH", "interacted_edges", lambda r: f"{r.get('actor_entity_id')}->{r.get('target_entity_id')}:{r.get('source_event_id')}") ,
+            ("INTERACTED_WITH", "interacted_edges", lambda r: f"{r.get('actor_entity_id')}->{r.get('target_entity_id')}:{r.get('source_event_id')}"),
             ("WORKS_AT", "works_at_edges", lambda r: f"{r.get('entity_id')}->{r.get('company_id')}"),
             ("MEMBER_OF", "member_of_edges", lambda r: f"{r.get('user_id')}->{r.get('company_id')}"),
             ("HAS_TOPIC", "has_topic_edges", lambda r: f"{r.get('entity_id')}->{r.get('topic_id')}"),
             ("INTRO_PATH", "intro_path_edges", lambda r: f"{r.get('user_id')}->{r.get('target_entity_id')}"),
         ]
+        deduped_edges: dict[tuple, dict] = {}
         for edge_type, key, key_fn in edge_configs:
             for row in list(snapshot.get(key, [])):
                 edge_key = key_fn(row)
@@ -510,16 +512,16 @@ class GraphProjectionService:
                 row_hash = hashlib.sha256(
                     json.dumps(row, sort_keys=True, default=str).encode("utf-8")
                 ).hexdigest()
-                edge_rows.append(
-                    {
-                        "run_id": run_id,
-                        "tenant_id": tenant_id,
-                        "edge_type": edge_type,
-                        "edge_key": edge_key,
-                        "edge_hash": row_hash,
-                        "projected_at": _utc_now_iso(),
-                    }
-                )
+                deduped_edges[(tenant_id, edge_type, edge_key)] = {
+                    "run_id": run_id,
+                    "tenant_id": tenant_id,
+                    "edge_type": edge_type,
+                    "edge_key": edge_key,
+                    "edge_hash": row_hash,
+                    "projected_at": _utc_now_iso(),
+                }
+
+        edge_rows = list(deduped_edges.values())
 
         if node_rows:
             node_resp = httpx.post(
