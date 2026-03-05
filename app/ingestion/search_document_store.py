@@ -169,7 +169,7 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
         for doc in documents:
             by_tenant[doc.tenant_id].append(doc)
 
-        payload: list[dict[str, Any]] = []
+        payload_dict: dict[tuple, dict[str, Any]] = {}
         skipped = 0
 
         for tenant_id, docs in by_tenant.items():
@@ -188,24 +188,31 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
                 if not entity_id:
                     skipped += 1
                     continue
-                payload.append({
+                # We use content itself for deduplication as per the unique constraint
+                key = (doc.tenant_id, entity_id, doc.doc_type, doc.content)
+                payload_dict[key] = {
                     "tenant_id": doc.tenant_id,
                     "entity_id": entity_id,
                     "doc_type": doc.doc_type,
                     "content": doc.content,
                     "metadata_json": doc.metadata_json,
                     "source_updated_at": doc.source_updated_at,
-                })
+                }
+
+        payload = list(payload_dict.values())
 
         # ── 3. Bulk insert/upsert all documents in one POST ────────────────────
         if payload:
-            response = httpx.post(
-                self._url("search_documents"),
-                headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
-                params={"on_conflict": "tenant_id,entity_id,doc_type,content"},
-                json=payload,
-                timeout=30.0,
-            )
+            # We chunk the UPSERTs to stay comfortably within limits
+            for i in range(0, len(payload), 500):
+                chunk = payload[i:i + 500]
+                response = httpx.post(
+                    self._url("search_documents"),
+                    headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                    params={"on_conflict": "tenant_id,entity_id,doc_type,content"},
+                    json=chunk,
+                    timeout=30.0,
+                )
             if response.status_code >= 400:
                 raise RuntimeError(
                     f"Supabase search_documents upsert failed ({response.status_code}): {response.text}"
