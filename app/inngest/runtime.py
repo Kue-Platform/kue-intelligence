@@ -454,21 +454,64 @@ def _cache_metrics_snapshot() -> dict[str, Any]:
     return {"stats": stats}
 
 
-def _fetch_and_process_raw(trace_id: str) -> dict[str, Any]:
-    """Group 1 collapse: fetch raw events (1 DB read) + parse + validate + enrich (all pure Python).
+def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict[str, Any]:
+    """Fetch + parse + validate + enrich + persist canonical + all enrichment transforms.
 
-    Replaces 4 Inngest steps (fetch_raw, parse, validate_canonical, clean_and_enrich)
-    each of which was serializing/deserializing the full raw event blob.
+    All previous steps in this chain returned the full enrichment_result (parsed events,
+    enriched events, etc.) as step output, which for Gmail/Calendar datasets exceeds
+    Inngest's 256 KB serialization limit.
+
+    This function consumes enrichment_result ENTIRELY INLINE — it never appears in the
+    return value. The output is only compact structured slices (model-dumped results)
+    plus summary counts. Typical output: <50 KB regardless of dataset size.
     """
+    # 1. Fetch raw events from store (1 DB read)
     raw = _fetch_raw_events(trace_id)
-    parsed = _parse_raw_events(list(raw.get("events", [])))
+    raw_events = list(raw.get("events", []))
+
+    # 2. Parse → validate → enrich  (pure Python, enrichment_result stays local)
+    parsed = _parse_raw_events(raw_events)
     validated = validate_parsed_events(dict(parsed)).model_dump(mode="json")
     enriched = clean_and_enrich_events(dict(validated)).model_dump(mode="json")
+
+    # 3. Persist canonical (DB write, was its own step — enrichment_result consumed here)
+    canonical = _persist_canonical(run_id, enriched, parser_version)
+
+    # 4. All enrichment transforms (pure Python, was its own step — enrichment_result consumed here)
+    process = _process_enrichment(enriched)
+
+    # Capture validation counts BEFORE deleting the large intermediate dicts
+    valid_count = int(validated.get("valid_count", 0))
+    invalid_count = int(validated.get("invalid_count", 0))
+    invalid_events = list(validated.get("invalid_events", []))
+
+    # enrichment_result (the large blob) is now GC-able — never returned
+    del enriched, validated
+
     return {
-        "raw_count": raw.get("count", 0),
-        "parse_result": parsed,
-        "validation_result": validated,
-        "enrichment_result": enriched,
+        # Summary counts (no event arrays)
+        "raw_count":      raw.get("count", 0),
+        "parsed_count":   parsed.get("parsed_count", 0),
+        "failed_count":   parsed.get("failed_count", 0),
+        "valid_count":    valid_count,
+        "invalid_count":  invalid_count,
+        "invalid_events": invalid_events,
+        "enriched_count": process.get("entity_candidate_count", 0),
+        # canonical persist metadata (small)
+        **canonical,
+        # Compact typed slices for downstream persist steps
+        "merge_result":    process["merge_result"],
+        "metadata_result": process["metadata_result"],
+        "semantic_result": process["semantic_result"],
+        "extract_result":  process["extract_result"],
+        "strength_result": process["strength_result"],
+        # Enrichment counts for summary
+        "entity_candidate_count": process["entity_candidate_count"],
+        "resolved_count":         process["resolved_count"],
+        "metadata_count":         process["metadata_count"],
+        "document_count":         process["document_count"],
+        "interaction_count":      process["interaction_count"],
+        "relationship_count":     process["relationship_count"],
     }
 
 
@@ -678,10 +721,12 @@ def _run_layer_internal(
             result = validate_parsed_events(dict(payload["parse_result"])).model_dump(mode="json")
         elif op == "clean_and_enrich":
             result = clean_and_enrich_events(dict(payload["validation_result"])).model_dump(mode="json")
-        elif op == "fetch_and_process_raw":
-            result = _fetch_and_process_raw(str(payload["trace_id"]))
-        elif op == "process_enrichment":
-            result = _process_enrichment(dict(payload["enrichment_result"]))
+        elif op == "ingest_and_process":
+            result = _ingest_and_process(
+                str(payload["trace_id"]),
+                str(payload["run_id"]),
+                str(payload["parser_version"]),
+            )
         elif op == "entity_persist":
             result = _persist_entities(dict(payload["merge_result"]))
         elif op == "persist_relationships":
@@ -720,12 +765,6 @@ def _run_layer_internal(
                 dict(payload["prepare_result"]),
                 dict(payload["node_result"]),
                 dict(payload["edge_result"]),
-            )
-        elif op == "persist_canonical":
-            result = _persist_canonical(
-                run_id,
-                dict(payload["parse_result"]),
-                str(payload["parser_version"]),
             )
         else:
             raise ValueError(f"Unsupported layer operation: {op}")
@@ -770,14 +809,14 @@ def _layer_persist_raw_events(run_id: str, source_events_payload: list[dict[str,
     )
 
 
-def _layer_fetch_and_process_raw(run_id: str, trace_id: str) -> dict[str, Any]:
+def _layer_ingest_and_process(run_id: str, trace_id: str, parser_version: str) -> dict[str, Any]:
     return _run_layer_internal(
         run_id=run_id,
         stage_key="canonicalization",
-        layer_key="fetch_and_process",
+        layer_key="ingest_and_process",
         records_in=None,
-        op="fetch_and_process_raw",
-        payload={"trace_id": trace_id},
+        op="ingest_and_process",
+        payload={"trace_id": trace_id, "run_id": run_id, "parser_version": parser_version},
     )
 
 
@@ -1055,48 +1094,36 @@ async def _run_pipeline_core(
                 source_events_payload,
             )
 
-        raw_process = await ctx.step.run(
-            "stage.canonicalization.layer.fetch_and_process",
-            _layer_fetch_and_process_raw,
+        ingest_result = await ctx.step.run(
+            "stage.canonicalization.layer.ingest_and_process",
+            _layer_ingest_and_process,
             run_id,
             trace_id,
-        )
-        canonical_result = await ctx.step.run(
-            "stage.canonicalization.layer.persist",
-            _layer_persist_canonical,
-            run_id,
-            raw_process["enrichment_result"],
             parser_version,
-        )
-        process_result = await ctx.step.run(
-            "stage.enrichment.layer.process_all",
-            _layer_process_enrichment,
-            run_id,
-            raw_process["enrichment_result"],
         )
         entity_persist = await ctx.step.run(
             "stage.entity_resolution.layer.persist_entities",
             _layer_entity_persist,
             run_id,
-            process_result["merge_result"],
+            ingest_result["merge_result"],
         )
         metadata_persist = await ctx.step.run(
             "stage.metadata_extraction.layer.persist_metadata",
             _layer_persist_metadata,
             run_id,
-            process_result["metadata_result"],
+            ingest_result["metadata_result"],
         )
         semantic_persist = await ctx.step.run(
             "stage.semantic_prep.layer.persist_search_documents",
             _layer_persist_semantic_documents,
             run_id,
-            process_result["semantic_result"],
+            ingest_result["semantic_result"],
         )
         embedding_lookup = await ctx.step.run(
             "stage.embedding.layer.cache_lookup",
             _layer_embedding_cache_lookup,
             run_id,
-            process_result["semantic_result"],
+            ingest_result["semantic_result"],
         )
         embedding_vectors = await ctx.step.run(
             "stage.embedding.layer.generate_vectors",
@@ -1126,8 +1153,8 @@ async def _run_pipeline_core(
             "stage.relationship_extraction.layer.persist_relationships",
             _layer_persist_relationships,
             run_id,
-            process_result["extract_result"],
-            process_result["strength_result"],
+            ingest_result["extract_result"],
+            ingest_result["strength_result"],
         )
         graph_prepare = await ctx.step.run(
             "stage.graph_projection.layer.prepare",
@@ -1160,29 +1187,29 @@ async def _run_pipeline_core(
             "status": "completed",
             "raw_capture": raw_result,
             "canonicalization": {
-                "raw_count": raw_process.get("raw_count", 0),
-                "parsed_count": raw_process.get("parse_result", {}).get("parsed_count", 0),
-                "failed_count": raw_process.get("parse_result", {}).get("failed_count", 0),
-                **canonical_result,
+                "raw_count": ingest_result.get("raw_count", 0),
+                "parsed_count": ingest_result.get("parsed_count", 0),
+                "failed_count": ingest_result.get("failed_count", 0),
+                **{k: v for k, v in ingest_result.items() if k in ("stored_count", "captured_at", "store")},
             },
             "validation": {
-                "valid_count": raw_process.get("validation_result", {}).get("valid_count", 0),
-                "invalid_count": raw_process.get("validation_result", {}).get("invalid_count", 0),
-                "invalid_events": raw_process.get("validation_result", {}).get("invalid_events", []),
+                "valid_count": ingest_result.get("valid_count", 0),
+                "invalid_count": ingest_result.get("invalid_count", 0),
+                "invalid_events": ingest_result.get("invalid_events", []),
             },
             "cleaning_enrichment": {
-                "enriched_count": raw_process.get("enrichment_result", {}).get("enriched_count", 0),
+                "enriched_count": ingest_result.get("enriched_count", 0),
             },
             "entity_resolution": {
-                "candidate_count": process_result.get("entity_candidate_count", 0),
-                "resolved_count": process_result.get("resolved_count", 0),
+                "candidate_count": ingest_result.get("entity_candidate_count", 0),
+                "resolved_count": ingest_result.get("resolved_count", 0),
                 **entity_persist,
             },
             "metadata_extraction": {
                 **metadata_persist,
             },
             "semantic_prep": {
-                "document_count": process_result.get("document_count", 0),
+                "document_count": ingest_result.get("document_count", 0),
                 **semantic_persist,
             },
             "embedding": {
@@ -1201,8 +1228,8 @@ async def _run_pipeline_core(
                 **search_index_result,
             },
             "relationship_extraction": {
-                "interaction_count": process_result.get("interaction_count", 0),
-                "relationship_count": process_result.get("relationship_count", 0),
+                "interaction_count": ingest_result.get("interaction_count", 0),
+                "relationship_count": ingest_result.get("relationship_count", 0),
                 **relationship_persist,
             },
             "graph_projection": {
@@ -1309,48 +1336,36 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
     run_id = str(run_info["run_id"])
     trace_id = str(run_info["trace_id"])
     try:
-        raw_process = await ctx.step.run(
-            "stage.canonicalization.layer.fetch_and_process",
-            _layer_fetch_and_process_raw,
+        ingest_result = await ctx.step.run(
+            "stage.canonicalization.layer.ingest_and_process",
+            _layer_ingest_and_process,
             run_id,
             trace_id,
-        )
-        canonical_result = await ctx.step.run(
-            "stage.canonicalization.layer.persist",
-            _layer_persist_canonical,
-            run_id,
-            raw_process["enrichment_result"],
             parser_version,
-        )
-        process_result = await ctx.step.run(
-            "stage.enrichment.layer.process_all",
-            _layer_process_enrichment,
-            run_id,
-            raw_process["enrichment_result"],
         )
         entity_persist = await ctx.step.run(
             "stage.entity_resolution.layer.persist_entities",
             _layer_entity_persist,
             run_id,
-            process_result["merge_result"],
+            ingest_result["merge_result"],
         )
         metadata_persist = await ctx.step.run(
             "stage.metadata_extraction.layer.persist_metadata",
             _layer_persist_metadata,
             run_id,
-            process_result["metadata_result"],
+            ingest_result["metadata_result"],
         )
         semantic_persist = await ctx.step.run(
             "stage.semantic_prep.layer.persist_search_documents",
             _layer_persist_semantic_documents,
             run_id,
-            process_result["semantic_result"],
+            ingest_result["semantic_result"],
         )
         embedding_lookup = await ctx.step.run(
             "stage.embedding.layer.cache_lookup",
             _layer_embedding_cache_lookup,
             run_id,
-            process_result["semantic_result"],
+            ingest_result["semantic_result"],
         )
         embedding_vectors = await ctx.step.run(
             "stage.embedding.layer.generate_vectors",
@@ -1380,8 +1395,8 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             "stage.relationship_extraction.layer.persist_relationships",
             _layer_persist_relationships,
             run_id,
-            process_result["extract_result"],
-            process_result["strength_result"],
+            ingest_result["extract_result"],
+            ingest_result["strength_result"],
         )
         graph_prepare = await ctx.step.run(
             "stage.graph_projection.layer.prepare",
@@ -1411,27 +1426,27 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
         summary = {
             "trace_id": trace_id,
             "run_id": run_id,
-            "raw_count": raw_process.get("raw_count", 0),
-            "parsed_count": raw_process.get("parse_result", {}).get("parsed_count", 0),
-            "failed_count": raw_process.get("parse_result", {}).get("failed_count", 0),
+            "raw_count": ingest_result.get("raw_count", 0),
+            "parsed_count": ingest_result.get("parsed_count", 0),
+            "failed_count": ingest_result.get("failed_count", 0),
             "validation": {
-                "valid_count": raw_process.get("validation_result", {}).get("valid_count", 0),
-                "invalid_count": raw_process.get("validation_result", {}).get("invalid_count", 0),
-                "invalid_events": raw_process.get("validation_result", {}).get("invalid_events", []),
+                "valid_count": ingest_result.get("valid_count", 0),
+                "invalid_count": ingest_result.get("invalid_count", 0),
+                "invalid_events": ingest_result.get("invalid_events", []),
             },
             "cleaning_enrichment": {
-                "enriched_count": raw_process.get("enrichment_result", {}).get("enriched_count", 0),
+                "enriched_count": ingest_result.get("enriched_count", 0),
             },
             "entity_resolution": {
-                "candidate_count": process_result.get("entity_candidate_count", 0),
-                "resolved_count": process_result.get("resolved_count", 0),
+                "candidate_count": ingest_result.get("entity_candidate_count", 0),
+                "resolved_count": ingest_result.get("resolved_count", 0),
                 **entity_persist,
             },
             "metadata_extraction": {
                 **metadata_persist,
             },
             "semantic_prep": {
-                "document_count": process_result.get("document_count", 0),
+                "document_count": ingest_result.get("document_count", 0),
                 **semantic_persist,
             },
             "embedding": {
@@ -1450,8 +1465,8 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
                 **search_index_result,
             },
             "relationship_extraction": {
-                "interaction_count": process_result.get("interaction_count", 0),
-                "relationship_count": process_result.get("relationship_count", 0),
+                "interaction_count": ingest_result.get("interaction_count", 0),
+                "relationship_count": ingest_result.get("relationship_count", 0),
                 **relationship_persist,
             },
             "graph_projection": {
@@ -1463,7 +1478,7 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
                 "snapshot_checksum": graph_finalize.get("snapshot_checksum"),
                 "store": graph_finalize.get("store"),
             },
-            **canonical_result,
+            **{k: v for k, v in ingest_result.items() if k in ("stored_count", "captured_at", "store")},
         }
         await ctx.step.run("stage.orchestration.layer.complete_run", _mark_run_succeeded, run_id, summary)
         return summary
