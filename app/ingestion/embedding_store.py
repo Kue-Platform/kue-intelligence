@@ -175,7 +175,9 @@ class SupabaseEmbeddingStore(EmbeddingStore):
             emails = list({i.primary_email for i in valid})
             email_to_id = self._bulk_resolve_entity_ids(tenant_id, emails)
 
-            # ── 2. PATCH embedding vector per record (unavoidable: each is unique) ──
+            # ── 2. Bulk-upsert embedding vectors (1 POST per tenant) ──────────────
+            # Previous: 1 PATCH per record (N calls). pgvector literals work fine in batches.
+            update_rows: list[dict] = []
             for item in valid:
                 entity_id = email_to_id.get(item.primary_email)
                 if not entity_id:
@@ -183,23 +185,28 @@ class SupabaseEmbeddingStore(EmbeddingStore):
                     continue
                 # pgvector expects a literal string like '[0.1,0.2,...]'
                 vector_literal = "[" + ",".join(f"{v:.6f}" for v in item.embedding) + "]"
-                response = httpx.patch(
+                update_rows.append({
+                    "tenant_id": item.tenant_id,
+                    "entity_id": entity_id,
+                    "doc_type": item.doc_type,
+                    "content": item.content,
+                    "embedding": vector_literal,
+                })
+
+            if update_rows:
+                bulk_resp = httpx.post(
                     self._url("search_documents"),
-                    headers=self._base_headers,
-                    params={
-                        "tenant_id": f"eq.{item.tenant_id}",
-                        "entity_id": f"eq.{entity_id}",
-                        "doc_type": f"eq.{item.doc_type}",
-                        "content":  f"eq.{item.content}",
-                    },
-                    json={"embedding": vector_literal},
+                    headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                    params={"on_conflict": "tenant_id,entity_id,doc_type,content"},
+                    json=update_rows,
                     timeout=30.0,
                 )
-                if response.status_code >= 400:
+                if bulk_resp.status_code >= 400:
                     raise RuntimeError(
-                        f"Supabase embedding persist failed ({response.status_code}): {response.text}"
+                        f"Supabase embedding bulk persist failed ({bulk_resp.status_code}): {bulk_resp.text}"
                     )
-                persisted += 1
+                persisted += len(update_rows)
+
 
         return EmbeddingPersistResult(persisted, skipped)
 

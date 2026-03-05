@@ -241,7 +241,10 @@ class SupabaseSearchIndexStore(SearchIndexStore):
                 key = (str(row["entity_id"]), str(row["doc_type"]), str(row["content"]))
                 doc_by_key[key] = row
 
-            # ── 3. PATCH metadata on each matched doc (unavoidable: per-doc keywords) ─
+            # ── 3. Bulk-update metadata on matched docs (1 POST upsert per tenant) ─
+            # Previous code: per-doc PATCH loop (N calls for N matched documents).
+            # Fix: collect all updates then send as a single merge-duplicates upsert on id.
+            update_rows: list[dict] = []
             for signal in valid:
                 entity_id = email_to_id.get(signal.primary_email)
                 if not entity_id:
@@ -256,18 +259,28 @@ class SupabaseSearchIndexStore(SearchIndexStore):
                 metadata["hybrid_keywords"] = signal.keywords
                 metadata["embedding_ready"] = signal.embedding_ready
                 metadata["indexed"] = True
-                patch = httpx.patch(
+                update_rows.append({
+                    "id": row["id"],
+                    "tenant_id": tenant_id,
+                    "entity_id": entity_id,
+                    "doc_type": signal.doc_type,
+                    "content": signal.content,
+                    "metadata_json": metadata,
+                })
+
+            if update_rows:
+                bulk_patch = httpx.post(
                     self._url("search_documents"),
-                    headers=self._base_headers,
-                    params={"id": f"eq.{row['id']}"},
-                    json={"metadata_json": metadata},
-                    timeout=20.0,
+                    headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                    params={"on_conflict": "id"},
+                    json=update_rows,
+                    timeout=30.0,
                 )
-                if patch.status_code >= 400:
+                if bulk_patch.status_code >= 400:
                     raise RuntimeError(
-                        f"Supabase search_documents index patch failed ({patch.status_code}): {patch.text}"
+                        f"Supabase search_documents bulk index update failed ({bulk_patch.status_code}): {bulk_patch.text}"
                     )
-                applied += 1
+                applied += len(update_rows)
 
         return SearchIndexPersistResult(applied, skipped)
 
