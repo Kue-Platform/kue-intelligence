@@ -484,6 +484,7 @@ class SupabaseEntityStore(EntityStore):
                 merged_metadata.update(item.metadata_json)
                 update_rows.append({
                     "entity_id": existing["entity_id"],
+                    "tenant_id": tenant_id,
                     "display_name": item.display_name,
                     "company_norm": item.metadata_json.get("company_norm"),
                     "title_norm": item.metadata_json.get("title_norm"),
