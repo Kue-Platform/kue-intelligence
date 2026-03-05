@@ -197,17 +197,18 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
                     "source_updated_at": doc.source_updated_at,
                 })
 
-        # ── 3. Bulk insert all documents in one POST ───────────────────────────
+        # ── 3. Bulk insert/upsert all documents in one POST ────────────────────
         if payload:
             response = httpx.post(
                 self._url("search_documents"),
-                headers=self._base_headers,
+                headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                params={"on_conflict": "tenant_id,entity_id,doc_type,content"},
                 json=payload,
                 timeout=30.0,
             )
             if response.status_code >= 400:
                 raise RuntimeError(
-                    f"Supabase search_documents insert failed ({response.status_code}): {response.text}"
+                    f"Supabase search_documents upsert failed ({response.status_code}): {response.text}"
                 )
         return SearchDocumentPersistResult(len(documents), len(payload), skipped)
 
