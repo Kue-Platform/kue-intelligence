@@ -258,7 +258,26 @@ async def google_oauth_callback(
 async def google_oauth_callback_mock(
     request: GoogleOAuthMockCallbackRequest,
     dispatch_event: InngestDispatcher = Depends(get_inngest_dispatcher),
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    pipeline_store: PipelineStore = Depends(get_pipeline_store),
 ) -> GoogleOAuthCallbackResponse:
+    """Store-first mock ingestion: parse + persist source events synchronously here,
+    then fire a reference-only Inngest event (no payload blob).
+
+    The problem with the old approach: ctx.event.data carried the full 300+ email
+    payload dict, and Inngest re-sends the entire event context on EVERY step
+    invocation.  For Gmail/Calendar that is >1 MB per Vercel invocation — instantly
+    hits the 10 s FUNCTION_INVOCATION_TIMEOUT even at stage.orchestration.ensure_run,
+    which does no real work itself.
+
+    Fix: convert + persist here in <1 s, dispatch only counts.
+    """
+    from app.ingestion.google_connector import (
+        GoogleOAuthConnector,
+        GoogleOAuthContext,
+        GoogleMockSourceType,
+    )
+
     try:
         resolved_tenant_id, resolved_user_id = resolve_google_state(
             state=request.state,
@@ -269,6 +288,42 @@ async def google_oauth_callback_mock(
     except GoogleConnectorError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # 1. Convert raw mock payload → typed SourceEvents (pure Python, fast)
+    try:
+        connector = GoogleOAuthConnector()
+        source_events = connector.handle_mock_callback(
+            context=GoogleOAuthContext(
+                tenant_id=resolved_tenant_id,
+                user_id=resolved_user_id,
+                trace_id=trace_id,
+            ),
+            source_type=GoogleMockSourceType(str(request.source_type)),
+            payload=dict(request.payload),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Mock connector failed: {exc}") from exc
+
+    # 2. Create pipeline run record
+    pipeline_store.ensure_tenant_user(resolved_tenant_id, resolved_user_id)
+    run_id = pipeline_store.create_pipeline_run(
+        trace_id=trace_id,
+        tenant_id=resolved_tenant_id,
+        user_id=resolved_user_id,
+        source=source_events[0].source if source_events else request.source_type,
+        trigger_type="kue/user.mock_connected",
+        source_event_id=str(source_events[0].source_event_id) if source_events else None,
+        metadata={"event_name": "kue/user.mock_connected", "ingest_path": "mock_oauth"},
+    )
+
+    # 3. Persist all source events to raw_store (Supabase in prod)
+    try:
+        raw_store.persist_source_events(source_events, run_id=run_id, ingest_version="v1")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Raw store persist failed: {exc}") from exc
+
+    # 4. Fire a tiny reference event — NO payload blob, NO source_events list.
+    #    ctx.event.data will only carry: trace_id, tenant_id, user_id, run_id, source_count.
+    #    Inngest re-sends this on every step retry — keeping every Vercel invocation tiny.
     try:
         event_id = await dispatch_event(
             "kue/user.mock_connected",
@@ -276,9 +331,11 @@ async def google_oauth_callback_mock(
                 "trace_id": trace_id,
                 "tenant_id": resolved_tenant_id,
                 "user_id": resolved_user_id,
-                "source_type": str(request.source_type),
-                "payload": request.payload,
+                "run_id": run_id,
+                "source_count": len(source_events),
+                "pre_stored": True,
                 "parser_version": settings.parser_version,
+                # payload intentionally omitted — already in raw_store
             },
         )
     except Exception as exc:
@@ -289,9 +346,10 @@ async def google_oauth_callback_mock(
         user_id=resolved_user_id,
         trace_id=trace_id,
         source_events=[],
-        counts={},
+        counts={"source_events": len(source_events)},
         pipeline_event_name="kue/user.mock_connected",
         pipeline_event_id=event_id,
+        pipeline_status="accepted",
     )
 
 

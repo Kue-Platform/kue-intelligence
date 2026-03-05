@@ -1302,11 +1302,20 @@ async def ingestion_user_mock_connected(ctx: inngest.Context) -> dict[str, Any]:
     data = dict(ctx.event.data or {})
     parser_version = str(data.get("parser_version") or settings.parser_version)
 
-    await ctx.step.run("stage.intake.layer.validate_payload", _validate_oauth_payload, data)
-    fetched = await ctx.step.run("stage.intake.layer.fetch_mock", _fetch_google_source_events_from_mock, data)
-    # Merge fetch metadata into data so _run_pipeline_core knows events are pre-stored.
-    data["source_count"] = fetched.get("count", 0)
-    data["pre_stored"] = fetched.get("pre_stored", False)
+    if data.get("pre_stored"):
+        # Store-first path: HTTP handler already converted + persisted events and
+        # created the pipeline run. ctx.event.data has run_id + source_count only.
+        # Skip fetch step entirely — go straight to pipeline.
+        pass
+    else:
+        # Legacy path (source_type + payload in event data — kept for existing in-flight runs).
+        await ctx.step.run("stage.intake.layer.validate_payload", _validate_oauth_payload, data)
+        fetched = await ctx.step.run(
+            "stage.intake.layer.fetch_mock", _fetch_google_source_events_from_mock, data
+        )
+        data["source_count"] = fetched.get("count", 0)
+        data["pre_stored"] = fetched.get("pre_stored", False)
+
     return await _run_pipeline_core(
         ctx,
         data=data,
