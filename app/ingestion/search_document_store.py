@@ -213,10 +213,10 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
                     json=chunk,
                     timeout=30.0,
                 )
-            if response.status_code >= 400:
-                raise RuntimeError(
-                    f"Supabase search_documents upsert failed ({response.status_code}): {response.text}"
-                )
+                if response.status_code >= 400:
+                    raise RuntimeError(
+                        f"Supabase search_documents upsert failed ({response.status_code}): {response.text}"
+                    )
         return SearchDocumentPersistResult(len(documents), len(payload), skipped)
 
 

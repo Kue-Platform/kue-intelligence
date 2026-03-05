@@ -181,22 +181,28 @@ class SupabaseEmbeddingStore(EmbeddingStore):
             email_to_id = self._bulk_resolve_entity_ids(tenant_id, emails)
 
             # ── 2. Bulk-upsert embedding vectors (1 POST per tenant) ──────────────
-            # Previous: 1 PATCH per record (N calls). pgvector literals work fine in batches.
-            update_rows: list[dict] = []
+            # Deduplicate on (tenant_id, entity_id, doc_type, content) — the same
+            # composite key used by ON CONFLICT. Postgres raises PG21000 if the
+            # same row appears twice in one batch (e.g. Gmail + Calendar both emit
+            # the same semantic document for a shared participant).
+            deduped: dict[tuple, dict] = {}
             for item in valid:
                 entity_id = email_to_id.get(item.primary_email)
                 if not entity_id:
                     skipped += 1
                     continue
+                key = (item.tenant_id, entity_id, item.doc_type, item.content)
                 # pgvector expects a literal string like '[0.1,0.2,...]'
                 vector_literal = "[" + ",".join(f"{v:.6f}" for v in item.embedding) + "]"
-                update_rows.append({
+                deduped[key] = {
                     "tenant_id": item.tenant_id,
                     "entity_id": entity_id,
                     "doc_type": item.doc_type,
                     "content": item.content,
                     "embedding": vector_literal,
-                })
+                }
+
+            update_rows = list(deduped.values())
 
             if update_rows:
                 bulk_resp = httpx.post(
