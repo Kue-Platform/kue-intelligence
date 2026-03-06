@@ -109,10 +109,7 @@ def _validate_oauth_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _fetch_google_source_events_from_oauth(data: dict[str, Any]) -> dict[str, Any]:
-    """Fetch Google source events via OAuth, persist to raw_store immediately,
-    and return only counts.  This prevents large step-return payloads from
-    hitting Inngest's 256 KB serialization limit.
-    """
+    """Fetch Google source events and persist them before pipeline execution."""
     from app.core.config import settings as _settings
 
     connector = GoogleOAuthConnector()
@@ -124,20 +121,16 @@ async def _fetch_google_source_events_from_oauth(data: dict[str, Any]) -> dict[s
             trace_id=str(data["trace_id"]),
         ),
     )
-    # Persist here so the rest of the pipeline reads from the store by trace_id.
     store = create_raw_event_store(_settings)
     store.persist_source_events(source_events, ingest_version="v1")
     return {
         "count": len(source_events),
         "pre_stored": True,
-        # source_events intentionally omitted — already in raw_store
     }
 
 
 def _fetch_google_source_events_from_mock(data: dict[str, Any]) -> dict[str, Any]:
-    """Fetch mock Google source events, persist to raw_store immediately,
-    and return only counts.  Same store-first pattern as the OAuth path.
-    """
+    """Fetch mock source events and persist them before pipeline execution."""
     from app.core.config import settings as _settings
 
     connector = GoogleOAuthConnector()
@@ -150,13 +143,11 @@ def _fetch_google_source_events_from_mock(data: dict[str, Any]) -> dict[str, Any
         source_type=GoogleMockSourceType(str(data["source_type"])),
         payload=dict(data["payload"]),
     )
-    # Persist here so the rest of the pipeline reads from the store by trace_id.
     store = create_raw_event_store(_settings)
     store.persist_source_events(source_events, ingest_version="v1")
     return {
         "count": len(source_events),
         "pre_stored": True,
-        # source_events intentionally omitted — already in raw_store
     }
 
 
@@ -304,13 +295,7 @@ def _persist_relationships(
 
 
 def _process_enrichment(enrichment_payload: dict[str, Any]) -> dict[str, Any]:
-    """Run all pure-Python enrichment transforms in one pass (no I/O).
-
-    Replaces 7 separate Inngest steps (exact_match, merge_entities,
-    extract_metadata, build_search_documents, extract_interactions,
-    compute_relationship_strength, cache_enrichment) that each caused a
-    full enrichment_result serialize/deserialize round-trip for zero benefit.
-    """
+    """Run pure-Python enrichment transforms in one pass."""
     # Entity resolution (contact events only)
     entity_exact = extract_entity_candidates(enrichment_payload)
     entity_merged = merge_entity_candidates(entity_exact.model_dump(mode="json"))
@@ -326,13 +311,11 @@ def _process_enrichment(enrichment_payload: dict[str, Any]) -> dict[str, Any]:
     relationships = compute_relationship_strength(interactions.model_dump(mode="json"))
 
     return {
-        # Shaped to match the payload keys the existing persist ops already expect:
         "merge_result":    entity_merged.model_dump(mode="json"),
         "metadata_result": metadata.model_dump(mode="json"),
         "semantic_result": semantic.model_dump(mode="json"),
         "extract_result":  interactions.model_dump(mode="json"),
         "strength_result": relationships.model_dump(mode="json"),
-        # Counts surfaced for summary / records_in tracking:
         "entity_candidate_count": entity_exact.candidate_count,
         "resolved_count":         entity_merged.resolved_count,
         "metadata_count":         metadata.candidate_count,
@@ -376,17 +359,11 @@ def _persist_semantic_documents(semantic_payload: dict[str, Any]) -> dict[str, A
 
 
 def _generate_embedding_vectors(semantic_payload: dict[str, Any]) -> dict[str, Any]:
-    """Build embedding requests from semantic documents and generate vectors for all.
-
-    No cache lookup or cache store — all documents are embedded every run.
-    Vectors are written to the StepPayloadStore so the 1536-float arrays never
-    cross the Inngest serialization boundary.
-    """
+    """Generate embedding vectors and store them in StepPayloadStore."""
     run_id = str(semantic_payload.get("run_id", ""))
     requests = build_embedding_requests(semantic_payload)
     generated = generate_embeddings(requests)
 
-    # Write vectors to SPS — keeps step return value tiny
     sps = _step_payload_store()
     vectors_ref = sps.write(run_id, "embedding_generate", {
         "records": [item.model_dump(mode="json") for item in generated.generated],
@@ -424,12 +401,7 @@ def _persist_embeddings(vectors_ref_or_payload: dict[str, Any]) -> dict[str, Any
 
 
 def _build_signals(embedding_vectors: dict[str, Any]) -> dict[str, Any]:
-    """Build hybrid search signals from embedding vectors.
-
-    Replaces the old _post_embedding_process which bundled cache_store +
-    cache_metrics + build_hybrid_signals. Cache ops have been removed entirely.
-    Vectors are loaded from SPS via vectors_ref.
-    """
+    """Build hybrid search signals from embedding vectors."""
     vectors_ref = str(embedding_vectors.get("vectors_ref", ""))
     if vectors_ref:
         vectors_data = _step_payload_store().read(vectors_ref)
@@ -443,35 +415,22 @@ def _build_signals(embedding_vectors: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict[str, Any]:
-    """Fetch + parse + validate + enrich + persist canonical + all enrichment transforms
-    collapsed into one step.
-
-    Large intermediate results (enrichment slices) are written to the StepPayloadStore
-    so they never appear in the Inngest step return value, keeping it well under 256 KB.
-    Only compact counts + a step_ref are returned across the step boundary.
-    """
-    # 1. Fetch raw events from store (1 DB read)
+    """Fetch, canonicalize, enrich, and persist intermediate outputs."""
     raw = _fetch_raw_events(trace_id)
     raw_events = list(raw.get("events", []))
 
-    # 2. Parse → validate → enrich  (pure Python, large blobs stay local)
     parsed = _parse_raw_events(raw_events)
     validated = validate_parsed_events(dict(parsed)).model_dump(mode="json")
     enriched = clean_and_enrich_events(dict(validated)).model_dump(mode="json")
 
-    # 3. Persist canonical (DB write — consumed here, not returned)
     canonical = _persist_canonical(run_id, enriched, parser_version)
 
-    # 4. All enrichment transforms (pure Python)
     process = _process_enrichment(enriched)
 
-    # Capture validation counts before dropping the large intermediate dicts
     valid_count = int(validated.get("valid_count", 0))
     invalid_count = int(validated.get("invalid_count", 0))
     invalid_events = list(validated.get("invalid_events", []))
 
-    # 5. Write the enrichment slices to StepPayloadStore — these are the large parts.
-    #    Downstream persist steps will read them from the store by step_ref.
     sps = _step_payload_store()
     enrichment_ref = sps.write(run_id, "ingest_and_process", {
         "merge_result":    process["merge_result"],
@@ -481,12 +440,9 @@ def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict
         "strength_result": process["strength_result"],
     })
 
-    # Large blobs are now offloaded — safe to GC
     del enriched, validated
 
-    # Return ONLY compact counts + the step_ref (tiny, always < 1 KB)
     return {
-        # Counts for summary / pipeline tracking
         "raw_count":      raw.get("count", 0),
         "parsed_count":   parsed.get("parsed_count", 0),
         "failed_count":   parsed.get("failed_count", 0),
@@ -494,11 +450,8 @@ def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict
         "invalid_count":  invalid_count,
         "invalid_events": invalid_events,
         "enriched_count": process.get("entity_candidate_count", 0),
-        # Canonical persist metadata (small)
         **canonical,
-        # Reference for downstream steps to load enrichment slices
         "enrichment_ref": enrichment_ref,
-        # Enrichment counts for summary (scalars only)
         "entity_candidate_count": process["entity_candidate_count"],
         "resolved_count":         process["resolved_count"],
         "metadata_count":         process["metadata_count"],
@@ -510,11 +463,7 @@ def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict
 
 
 def _project_graph(prepare_result: dict[str, Any]) -> dict[str, Any]:
-    """Group 3 collapse: graph_project_nodes + graph_project_edges in one step.
-
-    Both read from the same prepare_result snapshot, both write to Neo4j,
-    and neither depends on the other's output. graph_finalize needs both results.
-    """
+    """Project graph nodes and edges from a prepared snapshot."""
     node_result = _graph_project_nodes(prepare_result)
     edge_result = _graph_project_edges(prepare_result)
     return {
@@ -635,8 +584,6 @@ def _ensure_pipeline_run(
     user_id = str(data["user_id"])
     trace_id = str(data["trace_id"])
 
-    # If the HTTP handler already created a pipeline run (store-first path),
-    # skip creation and reuse the provided run_id.
     existing_run_id = data.get("run_id")
     if existing_run_id:
         return {
@@ -1019,14 +966,9 @@ async def _run_pipeline_core(
     trace_id = str(run_info["trace_id"])
     tenant_id = str(run_info["tenant_id"])
     user_id = str(run_info["user_id"])
-    # pre_stored=True when the HTTP handler already persisted events (store-first path).
-    # For layer2/capture: run_info["pre_stored"] is set via run_id in event data.
-    # For OAuth paths: data["pre_stored"] is set by the fetch step before calling here.
     pre_stored = bool(run_info.get("pre_stored", False)) or bool(data.get("pre_stored", False))
     try:
         if pre_stored:
-            # Events are already in the raw store — skip validate + persist steps.
-            # Use source_count from the event data for the summary record.
             raw_result = {
                 "stored_count": int(data.get("source_count", 0)),
                 "trace_id": trace_id,
@@ -1054,7 +996,6 @@ async def _run_pipeline_core(
             trace_id,
             parser_version,
         )
-        # Load enrichment slices from SPS — offloaded by _ingest_and_process to stay < 256 KB.
         enrichment_slices = _step_payload_store().read(ingest_result["enrichment_ref"])
         semantic_result_with_run_id = {**enrichment_slices["semantic_result"], "run_id": run_id}
 
@@ -1248,12 +1189,8 @@ async def ingestion_user_mock_connected(ctx: inngest.Context) -> dict[str, Any]:
     parser_version = str(data.get("parser_version") or settings.parser_version)
 
     if data.get("pre_stored"):
-        # Store-first path: HTTP handler already converted + persisted events and
-        # created the pipeline run. ctx.event.data has run_id + source_count only.
-        # Skip fetch step entirely — go straight to pipeline.
         pass
     else:
-        # Legacy path (source_type + payload in event data — kept for existing in-flight runs).
         await ctx.step.run("stage.intake.layer.validate_payload", _validate_oauth_payload, data)
         fetched = await ctx.step.run(
             "stage.intake.layer.fetch_mock", _fetch_google_source_events_from_mock, data
@@ -1297,7 +1234,6 @@ async def replay_canonicalization(ctx: inngest.Context) -> dict[str, Any]:
             trace_id,
             parser_version,
         )
-        # Load enrichment slices from SPS — offloaded by _ingest_and_process to stay < 256 KB.
         enrichment_slices = _step_payload_store().read(ingest_result["enrichment_ref"])
         semantic_result_with_run_id = {**enrichment_slices["semantic_result"], "run_id": run_id}
 

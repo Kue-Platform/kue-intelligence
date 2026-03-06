@@ -339,7 +339,6 @@ class SupabaseEntityStore(EntityStore):
         total_created = total_updated = total_identities = 0
 
         for tenant_id, candidates in by_tenant.items():
-            # ── 1. Bulk-fetch existing entities by email (1 GET) ───────────────
             # We still need entity_id values to write entity_identities rows.
             emails = [c.primary_email for c in candidates if c.primary_email]
             known_by_email = self._bulk_fetch_entities_by_email(tenant_id, emails)
@@ -352,7 +351,6 @@ class SupabaseEntityStore(EntityStore):
             for c in existing_candidates:
                 entity_id_map[c.source_event_id] = known_by_email[c.primary_email]
 
-            # ── 2. Bulk-insert new entities (1 POST, return=representation) ────
             if new_candidates:
                 ins_resp = httpx.post(
                     self._url("entities"),
@@ -381,7 +379,6 @@ class SupabaseEntityStore(EntityStore):
                         entity_id_map[c.source_event_id] = eid
                         total_created += 1
 
-            # ── 3. Bulk-update existing entities (1 POST upsert on entity_id) ───
             # Deduplicate by entity_id: multiple candidates can map to the same entity
             # (e.g. same contact in Gmail + calendar). Postgres raises PG21000 if
             # entity_id appears twice in one ON CONFLICT DO UPDATE batch.
@@ -416,7 +413,6 @@ class SupabaseEntityStore(EntityStore):
                         )
                     total_updated += len(update_rows)
 
-            # ── 4. Native upsert all entity_identities (1 POST) ───────────────
             # on_conflict=(tenant_id,source,source_identity) → merge-duplicates
             identity_rows = [
                 {
@@ -464,7 +460,6 @@ class SupabaseEntityStore(EntityStore):
         for tenant_id, items in by_tenant.items():
             emails = [item.primary_email for item in items]
 
-            # ── 1. Bulk-fetch all matching entities in batched GETs ────────────
             unique_emails = list(set(emails))
             existing_by_email: dict[str, dict] = {}
             for i in range(0, len(unique_emails), 50):
@@ -485,7 +480,6 @@ class SupabaseEntityStore(EntityStore):
                     )
                 existing_by_email.update({row["primary_email"]: row for row in existing_resp.json()})
 
-            # ── 2. Bulk-update matched entities (1 POST upsert on entity_id) ────
             # Deduplicate by entity_id: same entity may appear from multiple sources
             # (contacts + gmail + calendar). Postgres raises PG21000 if the same
             # entity_id appears twice in one ON CONFLICT DO UPDATE batch.

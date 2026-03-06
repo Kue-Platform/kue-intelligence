@@ -261,16 +261,10 @@ async def google_oauth_callback_mock(
     raw_store: RawEventStore = Depends(get_raw_event_store),
     pipeline_store: PipelineStore = Depends(get_pipeline_store),
 ) -> GoogleOAuthCallbackResponse:
-    """Store-first mock ingestion: parse + persist source events synchronously here,
-    then fire a reference-only Inngest event (no payload blob).
+    """Store-first mock ingestion.
 
-    The problem with the old approach: ctx.event.data carried the full 300+ email
-    payload dict, and Inngest re-sends the entire event context on EVERY step
-    invocation.  For Gmail/Calendar that is >1 MB per Vercel invocation — instantly
-    hits the 10 s FUNCTION_INVOCATION_TIMEOUT even at stage.orchestration.ensure_run,
-    which does no real work itself.
-
-    Fix: convert + persist here in <1 s, dispatch only counts.
+    Converts the callback payload to source events, persists them, then emits a
+    compact Inngest event that references the persisted data.
     """
     from app.ingestion.google_connector import (
         GoogleOAuthConnector,
@@ -288,7 +282,6 @@ async def google_oauth_callback_mock(
     except GoogleConnectorError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # 1. Convert raw mock payload → typed SourceEvents (pure Python, fast)
     try:
         connector = GoogleOAuthConnector()
         source_events = connector.handle_mock_callback(
@@ -303,7 +296,6 @@ async def google_oauth_callback_mock(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Mock connector failed: {exc}") from exc
 
-    # 2. Create pipeline run record
     pipeline_store.ensure_tenant_user(resolved_tenant_id, resolved_user_id)
     run_id = pipeline_store.create_pipeline_run(
         trace_id=trace_id,
@@ -315,15 +307,11 @@ async def google_oauth_callback_mock(
         metadata={"event_name": "kue/user.mock_connected", "ingest_path": "mock_oauth"},
     )
 
-    # 3. Persist all source events to raw_store (Supabase in prod)
     try:
         raw_store.persist_source_events(source_events, run_id=run_id, ingest_version="v1")
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Raw store persist failed: {exc}") from exc
 
-    # 4. Fire a tiny reference event — NO payload blob, NO source_events list.
-    #    ctx.event.data will only carry: trace_id, tenant_id, user_id, run_id, source_count.
-    #    Inngest re-sends this on every step retry — keeping every Vercel invocation tiny.
     try:
         event_id = await dispatch_event(
             "kue/user.mock_connected",
@@ -335,7 +323,6 @@ async def google_oauth_callback_mock(
                 "source_count": len(source_events),
                 "pre_stored": True,
                 "parser_version": settings.parser_version,
-                # payload intentionally omitted — already in raw_store
             },
         )
     except Exception as exc:
@@ -373,10 +360,9 @@ async def run_layer2_capture(
     raw_store: RawEventStore = Depends(get_raw_event_store),
     pipeline_store: PipelineStore = Depends(get_pipeline_store),
 ) -> PipelineRunResponse:
-    """Store-first ingestion: persist source_events to raw_store synchronously,
-    then dispatch a lightweight reference-only Inngest event containing only
-    trace_id / tenant_id / user_id / counts.  This keeps the Inngest payload
-    well under the 256 KB hard limit regardless of batch size.
+    """Store-first manual capture endpoint.
+
+    Persists source events to raw storage and emits a compact pipeline event.
     """
     trace_id = request.source_events[0].trace_id if request.source_events else None
     if trace_id is None:
@@ -386,7 +372,6 @@ async def run_layer2_capture(
     user_id = request.source_events[0].user_id
     source = str(request.source_events[0].source)
 
-    # 1. Create a pipeline run record so the raw store rows carry a run_id.
     pipeline_store.ensure_tenant_user(tenant_id, user_id)
     run_id = pipeline_store.create_pipeline_run(
         trace_id=trace_id,
@@ -398,7 +383,6 @@ async def run_layer2_capture(
         metadata={"event_name": "pipeline/run.requested", "ingest_path": "layer2/capture"},
     )
 
-    # 2. Persist all source events to the raw store (Supabase in prod).
     try:
         raw_store.persist_source_events(
             request.source_events,
@@ -408,7 +392,6 @@ async def run_layer2_capture(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Raw store persist failed: {exc}") from exc
 
-    # 3. Dispatch a tiny reference event — no source_events blob.
     try:
         event_id = await dispatch_event(
             "pipeline/run.requested",
@@ -420,7 +403,6 @@ async def run_layer2_capture(
                 "source": source,
                 "source_count": len(request.source_events),
                 "parser_version": settings.parser_version,
-                # source_events intentionally omitted — already in raw_store
             },
         )
     except Exception as exc:

@@ -283,8 +283,7 @@ class SupabaseCanonicalEventStore(CanonicalEventStore):
                 raise RuntimeError(
                     f"Supabase canonical event insert failed ({response.status_code}): {response.text}"
                 )
-            # Conflict fallback: deduplicate on unique key before bulk upsert to
-            # avoid PG21000 if parsed_events contains duplicate (raw_event_id, event_type, parser_version).
+            # Deduplicate by canonical unique key before bulk upsert.
             deduped: dict[tuple, dict] = {
                 (row["raw_event_id"], row["event_type"], row["parser_version"]): row
                 for row in payload

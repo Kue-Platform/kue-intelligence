@@ -216,7 +216,6 @@ class SupabaseSearchIndexStore(SearchIndexStore):
             if not valid:
                 continue
 
-            # ── 1. Bulk-resolve entity IDs (1 GET per tenant) ─────────────────
             emails = list({s.primary_email for s in valid})
             email_to_id = self._bulk_resolve_entity_ids(tenant_id, emails)
 
@@ -225,7 +224,6 @@ class SupabaseSearchIndexStore(SearchIndexStore):
                 skipped += len(valid)
                 continue
 
-            # ── 2. Bulk-fetch all matching search_documents (chunked) ───────────
             doc_by_key: dict[tuple[str, str, str], dict] = {}
             for i in range(0, len(entity_ids), 50):
                 chunk = entity_ids[i:i + 50]
@@ -247,7 +245,6 @@ class SupabaseSearchIndexStore(SearchIndexStore):
                     key = (str(row["entity_id"]), str(row["doc_type"]), str(row["content"]))
                     doc_by_key[key] = row
 
-            # ── 3. Bulk-update metadata on matched docs (1 POST upsert per tenant) ─
             # Deduplicate by `id` — same doc can match multiple signals (same entity,
             # different source types). Postgres raises PG21000 if id appears twice.
             deduped_updates: dict[str, dict] = {}

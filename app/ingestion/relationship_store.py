@@ -198,7 +198,6 @@ class SupabaseRelationshipStore(RelationshipStore):
         interactions: list[InteractionCandidate],
         relationships: list[RelationshipAggregate],
     ) -> RelationshipPersistResult:
-        # ── Insert interaction_facts ───────────────────────────────────────────
         if interactions:
             payload = [
                 {
@@ -229,7 +228,6 @@ class SupabaseRelationshipStore(RelationshipStore):
                 relationships_upserted=0,
             )
 
-        # ── 1. Bulk-resolve entity IDs by email (1 GET per tenant) ────────────
         from collections import defaultdict
         by_tenant: dict[str, list[RelationshipAggregate]] = defaultdict(list)
         for rel in relationships:
@@ -266,7 +264,6 @@ class SupabaseRelationshipStore(RelationshipStore):
             if not rows:
                 continue
 
-            # ── 2. Native upsert — Postgres handles insert/update atomically ───
             # on_conflict=(tenant_id,from_entity_id,to_entity_id,relationship_type)
             upsert_resp = httpx.post(
                 self._url("relationships"),

@@ -32,8 +32,8 @@ flowchart TD
   A[Google OAuth Callback / Mock Callback] --> B[FastAPI Ingestion API]
   B --> C[Inngest Event Emit]
   C --> D[Inngest Function Runtime]
-  D --> E[Stage 1-12 Core Ingestion Pipeline]
-  E --> F[Stage 13 Graph Projection \n prepare -> project_nodes -> project_edges -> finalize]
+  D --> E[Core Ingestion Pipeline]
+  E --> F[Graph Projection Stage \n prepare -> project -> finalize]
   E --> G[Supabase Canonical Tables]
   F --> H[(Neo4j Context Graph)]
   F --> I[(Supabase Graph Mirror Tables)]
@@ -69,26 +69,21 @@ sequenceDiagram
 
 ## 4) Pipeline Stages
 
-## Stage Overview
+## Stage Overview (Current Runtime)
 
-1. `intake`
-2. `orchestration`
-3. `raw_capture`
-4. `canonicalization`
-5. `validation`
-6. `cleaning_enrichment`
-7. `entity_resolution`
-8. `metadata_extraction`
-9. `semantic_prep`
-10. `embedding`
-11. `caching`
-12. `search_indexing`
-13. `relationship_extraction`
-14. `graph_projection` (compressed into 4 layers)
+1. `intake` (OAuth and mock entry functions)
+2. `orchestration` (`ensure_run`, `complete_run`, `fail_run`)
+3. `raw_capture` (`validate`, `persist`) when input is not pre-stored
+4. `canonicalization` (`ingest_and_process`)
+5. `entity_resolution` (`persist_entities`)
+6. `metadata_extraction` (`persist_metadata`)
+7. `semantic_prep` (`persist_search_documents`)
+8. `embedding` (`generate_vectors`, `persist_vectors`)
+9. `search_indexing` (`build_signals`, `index_health_check`)
+10. `relationship_extraction` (`persist_relationships`)
+11. `graph_projection` (`prepare`, `project`, `finalize`)
 
-Note: execution ordering in code runs relationship extraction before graph projection and marks run completion at the end.
-
-## Stage 13: Graph Projection (Compressed)
+## Graph Projection Stage (Compressed)
 
 Implemented layers:
 1. `stage.graph_projection.layer.prepare`
@@ -96,13 +91,11 @@ Implemented layers:
 - Fetches projection inputs from Supabase
 - Builds snapshot + batch stats + checksum
 
-2. `stage.graph_projection.layer.project_nodes`
+2. `stage.graph_projection.layer.project`
 - Upserts `Person`, `User`, `Company`, `Topic`
-
-3. `stage.graph_projection.layer.project_edges`
 - Upserts `KNOWS`, `INTERACTED_WITH`, `WORKS_AT`, `MEMBER_OF`, `HAS_TOPIC`, `INTRO_PATH`
 
-4. `stage.graph_projection.layer.finalize`
+3. `stage.graph_projection.layer.finalize`
 - Verifies graph counts vs expected snapshot
 - Persists mirror state to Supabase graph projection tables
 
@@ -348,12 +341,10 @@ Per run:
 Per layer:
 - `pipeline_stage_runs` tracks stage/layer status, duration, error payload, input/output counts
 
-For graph stage:
-- stage keys in Inngest observability are:
-  - `graph_projection.prepare`
-  - `graph_projection.project_nodes`
-  - `graph_projection.project_edges`
-  - `graph_projection.finalize`
+For graph stage, Inngest layers are:
+- `stage.graph_projection.layer.prepare`
+- `stage.graph_projection.layer.project`
+- `stage.graph_projection.layer.finalize`
 
 ---
 
@@ -425,9 +416,8 @@ uv sync --group dev
 
 ## 17) Current Status Snapshot
 
-Implemented and working in repo:
-- Stage orchestration through graph projection
-- Compressed Stage 13 graph layers (4)
+Implemented in repo:
+- Inngest-based orchestration from intake through graph projection
+- Store-first ingestion paths for OAuth mock and manual capture
+- Step payload offloading for large intermediate objects
 - uv-based local workflow + CI workflow
-- Full automated tests passing locally with uv
-

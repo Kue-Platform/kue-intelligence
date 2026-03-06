@@ -66,7 +66,7 @@ class SqliteEmbeddingStore(EmbeddingStore):
                 )
                 """
             )
-            # Non-breaking migration for existing sqlite table.
+            # Ensure the column exists for vector persistence.
             columns = {row[1] for row in conn.execute("PRAGMA table_info(search_documents)").fetchall()}
             if "embedding_json" not in columns:
                 conn.execute("ALTER TABLE search_documents ADD COLUMN embedding_json TEXT")
@@ -176,11 +176,9 @@ class SupabaseEmbeddingStore(EmbeddingStore):
             if not valid:
                 continue
 
-            # ── 1. Bulk-resolve entity IDs (1 GET per tenant) ─────────────────
             emails = list({i.primary_email for i in valid})
             email_to_id = self._bulk_resolve_entity_ids(tenant_id, emails)
 
-            # ── 2. Bulk-upsert embedding vectors (1 POST per tenant) ──────────────
             # Deduplicate on (tenant_id, entity_id, doc_type, content) — the same
             # composite key used by ON CONFLICT. Postgres raises PG21000 if the
             # same row appears twice in one batch (e.g. Gmail + Calendar both emit

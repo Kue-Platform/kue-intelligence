@@ -448,8 +448,6 @@ class SupabasePipelineStore(PipelineStore):
     def ensure_tenant_user(self, tenant_id: str, user_id: str) -> None:
         now = _utc_now().isoformat()
 
-        # ── Upsert tenant (1 POST, atomic) ────────────────────────────────────
-        # Previous: GET (check) + PATCH or POST — 2 round trips.
         tenant_resp = httpx.post(
             self._url("tenants"),
             headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
@@ -462,7 +460,6 @@ class SupabasePipelineStore(PipelineStore):
                 f"Supabase tenants upsert failed ({tenant_resp.status_code}): {tenant_resp.text}"
             )
 
-        # ── Upsert tenant_user (1 POST, atomic) ───────────────────────────────
         user_resp = httpx.post(
             self._url("tenant_users"),
             headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
@@ -605,7 +602,6 @@ class SupabasePipelineStore(PipelineStore):
             "error_json": None,
         }
 
-        # ── 1. Check if this stage run already exists ──
         lookup = httpx.get(
             self._url("pipeline_stage_runs"),
             headers=self._base_headers,
@@ -636,7 +632,6 @@ class SupabasePipelineStore(PipelineStore):
                     )
                 return existing_id
 
-        # ── 2. Row does not exist yet — insert ──
         payload: dict[str, Any] = {
             "run_id": run_id,
             "stage_key": stage_key,
@@ -656,7 +651,6 @@ class SupabasePipelineStore(PipelineStore):
             timeout=20.0,
         )
         if response.status_code >= 400:
-            # ── 3. Race-condition fallback: another worker inserted first ──
             if not self._is_duplicate_conflict(response):
                 raise RuntimeError(
                     f"Supabase pipeline_stage_runs insert failed ({response.status_code}): {response.text}"

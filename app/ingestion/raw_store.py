@@ -247,8 +247,7 @@ class SupabaseRawEventStore(RawEventStore):
                 raise RuntimeError(
                     f"Supabase raw event insert failed ({response.status_code}): {response.text}"
                 )
-            # Conflict fallback: bulk upsert with merge-duplicates on unique key.
-            # Eliminates the previous per-row GET+PATCH loop (was N reads + N writes).
+            # Resolve unique-key conflicts with a bulk upsert.
             upsert_resp = httpx.post(
                 self._rest_url(),
                 headers={

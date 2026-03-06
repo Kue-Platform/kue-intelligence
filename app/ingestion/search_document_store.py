@@ -173,14 +173,12 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
         skipped = 0
 
         for tenant_id, docs in by_tenant.items():
-            # ── 1. Bulk-resolve all entity IDs in one GET per tenant ───────────
             emails = [doc.primary_email for doc in docs if doc.primary_email]
             skipped += sum(1 for doc in docs if not doc.primary_email)
             if not emails:
                 continue
             email_to_id = self._bulk_resolve_entity_ids(tenant_id, emails)
 
-            # ── 2. Build insert payload ────────────────────────────────────────
             for doc in docs:
                 if not doc.primary_email:
                     continue
@@ -201,7 +199,6 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
 
         payload = list(payload_dict.values())
 
-        # ── 3. Bulk insert/upsert all documents in one POST ────────────────────
         if payload:
             # We chunk the UPSERTs to stay comfortably within limits
             for i in range(0, len(payload), 500):
