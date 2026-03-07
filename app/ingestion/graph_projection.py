@@ -32,6 +32,10 @@ def _slug(value: str) -> str:
     return "".join(ch.lower() if ch.isalnum() else "_" for ch in value).strip("_")
 
 
+def _json_text(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, default=str)
+
+
 @dataclass
 class GraphProjectionService:
     settings: Settings
@@ -301,7 +305,7 @@ class GraphProjectionService:
                     "first_interaction_at": _norm_text(row.get("first_interaction_at")),
                     "last_interaction_at": _norm_text(row.get("last_interaction_at")),
                     "channels": channels,
-                    "evidence_json": evidence,
+                    "evidence_json": _json_text(evidence),
                     "updated_at": _norm_text(row.get("updated_at")) or _utc_now_iso(),
                 }
             )

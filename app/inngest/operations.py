@@ -25,6 +25,7 @@ from app.ingestion.search_index_store import create_search_index_store
 from app.ingestion.google_connector import GoogleOAuthConnector, GoogleOAuthContext
 from app.ingestion.parsers import parse_raw_events
 from app.ingestion.raw_store import create_raw_event_store
+from app.ingestion.source_connection_store import SourceConnectionRecord, create_source_connection_store
 from app.ingestion.validators import validate_parsed_events
 from app.schemas import GoogleMockSourceType, IngestionSource, SourceEvent
 
@@ -49,13 +50,33 @@ def _validate_oauth_payload(data: dict[str, Any]) -> dict[str, Any]:
 async def _fetch_google_source_events_from_oauth(data: dict[str, Any]) -> dict[str, Any]:
     """Fetch Google source events and persist them before pipeline execution."""
     connector = GoogleOAuthConnector()
-    source_events = await connector.handle_callback(
+    context = GoogleOAuthContext(
+        tenant_id=str(data["tenant_id"]),
+        user_id=str(data["user_id"]),
+        trace_id=str(data["trace_id"]),
+    )
+    source_events, connection = await connector.handle_callback_with_connection(
         code=str(data["code"]),
-        context=GoogleOAuthContext(
-            tenant_id=str(data["tenant_id"]),
-            user_id=str(data["user_id"]),
-            trace_id=str(data["trace_id"]),
-        ),
+        context=context,
+    )
+    _pipeline_store().ensure_tenant_user(context.tenant_id, context.user_id)
+    connected_sources = sorted({event.source for event in source_events}, key=str)
+    create_source_connection_store(settings).upsert_connections(
+        [
+            SourceConnectionRecord(
+                tenant_id=context.tenant_id,
+                user_id=context.user_id,
+                source=source,
+                external_account_id=connection.external_account_id,
+                scopes=connection.scopes,
+                token_json=connection.token_json,
+                token_expires_at=connection.token_expires_at,
+                status="active",
+                last_sync_at=None,
+                last_error=None,
+            )
+            for source in connected_sources
+        ]
     )
     store = create_raw_event_store(settings)
     store.persist_source_events(source_events, ingest_version="v1")

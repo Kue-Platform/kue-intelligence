@@ -37,6 +37,11 @@ from app.ingestion.embedding_store import EmbeddingStore, create_embedding_store
 from app.ingestion.cache_registry import cache_registry
 from app.ingestion.search_indexing import build_hybrid_signals
 from app.ingestion.search_index_store import SearchIndexStore, create_search_index_store
+from app.ingestion.source_connection_store import (
+    SourceConnectionRecord,
+    SourceConnectionStore,
+    create_source_connection_store,
+)
 from app.ingestion.validators import validate_parsed_events
 from app.schemas import (
     CanonicalEventType,
@@ -140,6 +145,15 @@ def _get_search_index_store() -> SearchIndexStore:
 
 def get_search_index_store() -> SearchIndexStore:
     return _get_search_index_store()
+
+
+@lru_cache(maxsize=1)
+def _get_source_connection_store() -> SourceConnectionStore:
+    return create_source_connection_store(settings)
+
+
+def get_source_connection_store() -> SourceConnectionStore:
+    return _get_source_connection_store()
 
 
 def _assert_admin_reset_token(token: str | None) -> None:
@@ -260,6 +274,7 @@ async def google_oauth_callback_mock(
     dispatch_event: InngestDispatcher = Depends(get_inngest_dispatcher),
     raw_store: RawEventStore = Depends(get_raw_event_store),
     pipeline_store: PipelineStore = Depends(get_pipeline_store),
+    source_connection_store: SourceConnectionStore = Depends(get_source_connection_store),
 ) -> GoogleOAuthCallbackResponse:
     """Store-first mock ingestion.
 
@@ -305,6 +320,24 @@ async def google_oauth_callback_mock(
         trigger_type="kue/user.mock_connected",
         source_event_id=str(source_events[0].source_event_id) if source_events else None,
         metadata={"event_name": "kue/user.mock_connected", "ingest_path": "mock_oauth"},
+    )
+    source_map = {
+        GoogleMockSourceType.CONTACTS: IngestionSource.GOOGLE_CONTACTS,
+        GoogleMockSourceType.GMAIL: IngestionSource.GMAIL,
+        GoogleMockSourceType.CALENDAR: IngestionSource.GOOGLE_CALENDAR,
+    }
+    source_connection_store.upsert_connections(
+        [
+            SourceConnectionRecord(
+                tenant_id=resolved_tenant_id,
+                user_id=resolved_user_id,
+                source=source_map[GoogleMockSourceType(str(request.source_type))],
+                external_account_id=f"mock:{resolved_user_id}",
+                scopes=[],
+                token_json={"provider": "google", "mock": True},
+                status="active",
+            )
+        ]
     )
 
     try:

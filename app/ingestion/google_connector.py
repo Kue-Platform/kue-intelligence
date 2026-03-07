@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -30,6 +30,14 @@ class GoogleOAuthContext:
     tenant_id: str
     user_id: str
     trace_id: str
+
+
+@dataclass
+class GoogleConnectionDetails:
+    external_account_id: str
+    scopes: list[str]
+    token_json: dict[str, Any]
+    token_expires_at: datetime | None
 
 
 def _parse_iso_datetime(value: str | None) -> datetime:
@@ -70,20 +78,21 @@ def resolve_google_state(
 
 
 class GoogleOAuthConnector:
-    async def handle_callback(
+    async def handle_callback_with_connection(
         self,
         *,
         code: str,
         context: GoogleOAuthContext,
-    ) -> list[SourceEvent]:
-        access_token = await self._exchange_code_for_token(code=code)
+    ) -> tuple[list[SourceEvent], GoogleConnectionDetails]:
+        token_payload = await self._exchange_code_for_token(code=code)
+        access_token = str(token_payload["access_token"])
 
         async with httpx.AsyncClient(timeout=20.0) as client:
             userinfo_task = self._fetch_userinfo(client=client, access_token=access_token)
             contacts_task = self._fetch_contacts(client=client, access_token=access_token)
             gmail_task = self._fetch_gmail_messages(client=client, access_token=access_token)
             calendar_task = self._fetch_calendar_events(client=client, access_token=access_token)
-            _, contacts, gmail_messages, calendar_events = await asyncio.gather(
+            userinfo, contacts, gmail_messages, calendar_events = await asyncio.gather(
                 userinfo_task,
                 contacts_task,
                 gmail_task,
@@ -94,6 +103,19 @@ class GoogleOAuthConnector:
         source_events.extend(self._to_contact_events(context=context, contacts=contacts))
         source_events.extend(self._to_gmail_events(context=context, messages=gmail_messages))
         source_events.extend(self._to_calendar_events(context=context, events=calendar_events))
+        return source_events, self._build_connection_details(
+            context=context,
+            token_payload=token_payload,
+            userinfo=userinfo,
+        )
+
+    async def handle_callback(
+        self,
+        *,
+        code: str,
+        context: GoogleOAuthContext,
+    ) -> list[SourceEvent]:
+        source_events, _ = await self.handle_callback_with_connection(code=code, context=context)
         return source_events
 
     def handle_mock_callback(
@@ -112,7 +134,7 @@ class GoogleOAuthConnector:
         events = self._normalize_calendar_payload(payload)
         return self._to_calendar_events(context=context, events=events)
 
-    async def _exchange_code_for_token(self, *, code: str) -> str:
+    async def _exchange_code_for_token(self, *, code: str) -> dict[str, Any]:
         if (
             not settings.google_oauth_client_id
             or not settings.google_oauth_client_secret
@@ -132,10 +154,39 @@ class GoogleOAuthConnector:
             response = await client.post(GOOGLE_TOKEN_URL, data=payload)
         if response.status_code >= 400:
             raise GoogleConnectorError(f"Token exchange failed with status {response.status_code}.")
-        token = response.json().get("access_token")
+        token_payload = response.json()
+        token = token_payload.get("access_token")
         if not token:
             raise GoogleConnectorError("Token exchange succeeded but access_token is missing.")
-        return token
+        return dict(token_payload)
+
+    def _build_connection_details(
+        self,
+        *,
+        context: GoogleOAuthContext,
+        token_payload: dict[str, Any],
+        userinfo: dict[str, Any],
+    ) -> GoogleConnectionDetails:
+        scopes_raw = str(token_payload.get("scope") or "").strip()
+        scopes = [s for s in scopes_raw.split(" ") if s] if scopes_raw else []
+        expires_in = token_payload.get("expires_in")
+        token_expires_at = None
+        if isinstance(expires_in, int):
+            token_expires_at = datetime.now(UTC) + timedelta(seconds=expires_in)
+        elif isinstance(expires_in, str) and expires_in.isdigit():
+            token_expires_at = datetime.now(UTC) + timedelta(seconds=int(expires_in))
+
+        external_account_id = (
+            str(userinfo.get("sub") or "").strip()
+            or str(userinfo.get("email") or "").strip()
+            or f"google:{context.user_id}"
+        )
+        return GoogleConnectionDetails(
+            external_account_id=external_account_id,
+            scopes=scopes,
+            token_json=token_payload,
+            token_expires_at=token_expires_at,
+        )
 
     async def _fetch_userinfo(self, *, client: httpx.AsyncClient, access_token: str) -> dict[str, Any]:
         response = await client.get(
