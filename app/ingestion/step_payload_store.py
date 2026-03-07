@@ -199,14 +199,30 @@ class SupabaseStepPayloadStore(StepPayloadStore):
             "payload_json": payload,   # stored as JSONB
             "created_at": datetime.now(UTC).isoformat(),
         }
-        # Upsert: on conflict (run_id, step_name) overwrite payload
+
         response = httpx.post(
             self._rest_url(),
             headers={**self._headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
-            json=row,
+            params={"on_conflict": "run_id,step_name"},
+            json=[row],
             timeout=30.0,
         )
         if response.status_code >= 400:
+            body = (response.text or "").lower()
+            is_conflict = response.status_code == 409 or "23505" in body
+            if is_conflict:
+                patch_response = httpx.patch(
+                    self._rest_url(),
+                    headers=self._headers,
+                    params={"run_id": f"eq.{run_id}", "step_name": f"eq.{step_name}"},
+                    json={
+                        "payload_json": payload,
+                        "created_at": row["created_at"],
+                    },
+                    timeout=30.0,
+                )
+                if patch_response.status_code < 400:
+                    return _make_ref(run_id, step_name)
             raise RuntimeError(
                 f"StepPayloadStore write failed ({response.status_code}): {response.text}"
             )
