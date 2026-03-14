@@ -48,6 +48,13 @@ def _validate_linkedin(payload: dict) -> int:
     return len(profiles)
 
 
+def _validate_csv_import(payload: dict) -> int:
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("csv_import payload must include a non-empty 'rows' list")
+    return len(rows)
+
+
 def trigger_mock_connector(
     *,
     source: IngestionSource,
@@ -58,8 +65,12 @@ def trigger_mock_connector(
         records_detected = _validate_google_contacts(payload)
     elif source == IngestionSource.GMAIL:
         records_detected = _validate_gmail(payload)
-    else:
+    elif source == IngestionSource.LINKEDIN:
         records_detected = _validate_linkedin(payload)
+    elif source == IngestionSource.CSV_IMPORT:
+        records_detected = _validate_csv_import(payload)
+    else:
+        raise ValueError(f"Unsupported source for mock connector: {source}")
 
     return ConnectorTriggerResult(
         connector_event_id=f"conn_{uuid4().hex}",
@@ -70,4 +81,3 @@ def trigger_mock_connector(
         records_detected=records_detected,
         payload_shape=_detect_shape(payload),
     )
-

@@ -264,3 +264,33 @@ class AdminResetResponse(BaseModel):
     ok: bool
     mode: str
     details: dict[str, Any] = {}
+
+
+class CsvImportSourceHint(StrEnum):
+    LINKEDIN = "linkedin"
+    CSV_IMPORT = "csv_import"
+    GOOGLE_CONTACTS = "google_contacts"
+
+
+class CsvImportMockRequest(BaseModel):
+    tenant_id: str
+    user_id: str
+    source_hint: CsvImportSourceHint
+    rows: list[dict[str, Any]] = Field(..., min_length=1)
+    trace_id: str | None = None
+    column_map: dict[str, str] | None = None
+    file_name: str | None = None
+
+
+class CsvImportResponse(BaseModel):
+    run_id: str
+    event_name: str
+    event_id: str | None = None
+    trace_id: str
+    rows_total: int
+    rows_accepted: int
+    rows_skipped: int
+    template_detected: str
+    mapping_mode: str
+    warning_samples: list[str] = []
+    status: str = "accepted"

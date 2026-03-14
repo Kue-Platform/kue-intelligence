@@ -1,14 +1,19 @@
 from functools import lru_cache
+import json
 import inspect
 from typing import Awaitable, Callable
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 import inngest
 
 from app.core.config import settings
 from app.ingestion.canonical_store import CanonicalEventStore, create_canonical_event_store
 from app.ingestion.connectors import trigger_mock_connector
+from app.ingestion.csv_import import (
+    normalize_csv_rows_to_source_events,
+    normalize_csv_text_to_source_events,
+)
 from app.ingestion.google_connector import (
     GoogleConnectorError,
     resolve_google_state,
@@ -70,6 +75,9 @@ from app.schemas import (
     PipelineRunResponse,
     RawEventsByTraceResponse,
     AdminResetResponse,
+    CsvImportMockRequest,
+    CsvImportResponse,
+    CsvImportSourceHint,
 )
 
 router = APIRouter(prefix="/v1/ingestion", tags=["ingestion"])
@@ -195,6 +203,244 @@ def get_inngest_dispatcher() -> InngestDispatcher:
         return await _send_inngest_event(name=name, data=data)
 
     return _dispatch
+
+
+@router.post("/import/csv/mock", response_model=CsvImportResponse)
+async def import_csv_mock(
+    request: CsvImportMockRequest,
+    dispatch_event: InngestDispatcher = Depends(get_inngest_dispatcher),
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    pipeline_store: PipelineStore = Depends(get_pipeline_store),
+    source_connection_store: SourceConnectionStore = Depends(get_source_connection_store),
+) -> CsvImportResponse:
+    trace_id = request.trace_id or f"trace_{uuid4().hex}"
+    normalized = normalize_csv_rows_to_source_events(
+        tenant_id=request.tenant_id,
+        user_id=request.user_id,
+        trace_id=trace_id,
+        source_hint=request.source_hint,
+        rows=request.rows,
+        column_map=request.column_map,
+    )
+    if normalized.rows_accepted == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "CSV import failed: no valid rows found.",
+                "rows_total": normalized.rows_total,
+                "rows_skipped": normalized.rows_skipped,
+                "warning_samples": normalized.warning_samples,
+            },
+        )
+
+    pipeline_store.ensure_tenant_user(request.tenant_id, request.user_id)
+    run_id = pipeline_store.create_pipeline_run(
+        trace_id=trace_id,
+        tenant_id=request.tenant_id,
+        user_id=request.user_id,
+        source=normalized.source,
+        trigger_type="pipeline/run.requested",
+        source_event_id=normalized.source_events[0].source_event_id,
+        metadata={
+            "event_name": "pipeline/run.requested",
+            "ingest_path": "import/csv/mock",
+            "import_file_name": request.file_name or "mock.csv",
+            "rows_total": normalized.rows_total,
+            "rows_accepted": normalized.rows_accepted,
+            "rows_skipped": normalized.rows_skipped,
+            "template_detected": normalized.template_detected,
+            "mapping_mode": normalized.mapping_mode,
+            "warning_samples": normalized.warning_samples[:5],
+        },
+    )
+    raw_store.persist_source_events(normalized.source_events, run_id=run_id, ingest_version="v1")
+    source_connection_store.upsert_connections(
+        [
+            SourceConnectionRecord(
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                source=normalized.source,
+                external_account_id=f"{normalized.source.value}_csv:{request.user_id}",
+                scopes=[],
+                token_json={
+                    "import_type": "csv",
+                    "file_name": request.file_name or "mock.csv",
+                    "template_detected": normalized.template_detected,
+                    "mapping_mode": normalized.mapping_mode,
+                },
+                status="active",
+                last_sync_at=normalized.source_events[0].occurred_at,
+                last_error=None,
+            )
+        ]
+    )
+
+    try:
+        event_id = await dispatch_event(
+            "pipeline/run.requested",
+            {
+                "trace_id": trace_id,
+                "tenant_id": request.tenant_id,
+                "user_id": request.user_id,
+                "run_id": run_id,
+                "source": str(normalized.source),
+                "source_count": normalized.rows_accepted,
+                "pre_stored": True,
+                "parser_version": settings.parser_version,
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Inngest dispatch failed: {exc}") from exc
+
+    return CsvImportResponse(
+        run_id=run_id,
+        event_name="pipeline/run.requested",
+        event_id=event_id,
+        trace_id=trace_id,
+        rows_total=normalized.rows_total,
+        rows_accepted=normalized.rows_accepted,
+        rows_skipped=normalized.rows_skipped,
+        template_detected=normalized.template_detected,
+        mapping_mode=normalized.mapping_mode,
+        warning_samples=normalized.warning_samples[:10],
+    )
+
+
+@router.post("/import/csv", response_model=CsvImportResponse)
+async def import_csv(
+    request: Request,
+    dispatch_event: InngestDispatcher = Depends(get_inngest_dispatcher),
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    pipeline_store: PipelineStore = Depends(get_pipeline_store),
+    source_connection_store: SourceConnectionStore = Depends(get_source_connection_store),
+) -> CsvImportResponse:
+    form = await request.form()
+    file_obj = form.get("file")
+    if file_obj is None:
+        raise HTTPException(status_code=400, detail="Missing file in multipart form.")
+
+    tenant_id = str(form.get("tenant_id") or "").strip()
+    user_id = str(form.get("user_id") or "").strip()
+    source_hint_raw = str(form.get("source_hint") or "").strip()
+    trace_id_raw = str(form.get("trace_id") or "").strip() or None
+    column_map = str(form.get("column_map") or "").strip() or None
+
+    if not tenant_id or not user_id:
+        raise HTTPException(status_code=400, detail="tenant_id and user_id are required.")
+    try:
+        source_hint = CsvImportSourceHint(source_hint_raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid source_hint.") from exc
+
+    file_bytes = await file_obj.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="CSV file is empty.")
+    try:
+        csv_text = file_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="CSV file must be UTF-8 encoded.") from exc
+
+    parsed_column_map: dict[str, str] | None = None
+    if column_map:
+        try:
+            loaded = json.loads(column_map)
+            if isinstance(loaded, dict):
+                parsed_column_map = {str(k): str(v) for k, v in loaded.items()}
+            else:
+                raise ValueError("column_map must be a JSON object")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid column_map JSON: {exc}") from exc
+
+    resolved_trace_id = trace_id_raw or f"trace_{uuid4().hex}"
+    normalized = normalize_csv_text_to_source_events(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        trace_id=resolved_trace_id,
+        source_hint=source_hint,
+        csv_text=csv_text,
+        column_map=parsed_column_map,
+    )
+    if normalized.rows_accepted == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "CSV import failed: no valid rows found.",
+                "rows_total": normalized.rows_total,
+                "rows_skipped": normalized.rows_skipped,
+                "warning_samples": normalized.warning_samples,
+            },
+        )
+
+    pipeline_store.ensure_tenant_user(tenant_id, user_id)
+    run_id = pipeline_store.create_pipeline_run(
+        trace_id=resolved_trace_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        source=normalized.source,
+        trigger_type="pipeline/run.requested",
+        source_event_id=normalized.source_events[0].source_event_id,
+        metadata={
+            "event_name": "pipeline/run.requested",
+            "ingest_path": "import/csv",
+            "import_file_name": getattr(file_obj, "filename", None) or "upload.csv",
+            "rows_total": normalized.rows_total,
+            "rows_accepted": normalized.rows_accepted,
+            "rows_skipped": normalized.rows_skipped,
+            "template_detected": normalized.template_detected,
+            "mapping_mode": normalized.mapping_mode,
+            "warning_samples": normalized.warning_samples[:5],
+        },
+    )
+    raw_store.persist_source_events(normalized.source_events, run_id=run_id, ingest_version="v1")
+    source_connection_store.upsert_connections(
+        [
+            SourceConnectionRecord(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                source=normalized.source,
+                external_account_id=f"{normalized.source.value}_csv:{user_id}",
+                scopes=[],
+                token_json={
+                    "import_type": "csv",
+                    "file_name": getattr(file_obj, "filename", None) or "upload.csv",
+                    "template_detected": normalized.template_detected,
+                    "mapping_mode": normalized.mapping_mode,
+                },
+                status="active",
+                last_sync_at=normalized.source_events[0].occurred_at,
+                last_error=None,
+            )
+        ]
+    )
+    try:
+        event_id = await dispatch_event(
+            "pipeline/run.requested",
+            {
+                "trace_id": resolved_trace_id,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "run_id": run_id,
+                "source": str(normalized.source),
+                "source_count": normalized.rows_accepted,
+                "pre_stored": True,
+                "parser_version": settings.parser_version,
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Inngest dispatch failed: {exc}") from exc
+
+    return CsvImportResponse(
+        run_id=run_id,
+        event_name="pipeline/run.requested",
+        event_id=event_id,
+        trace_id=resolved_trace_id,
+        rows_total=normalized.rows_total,
+        rows_accepted=normalized.rows_accepted,
+        rows_skipped=normalized.rows_skipped,
+        template_detected=normalized.template_detected,
+        mapping_mode=normalized.mapping_mode,
+        warning_samples=normalized.warning_samples[:10],
+    )
 
 
 @router.post("/mock", response_model=IngestionMockTriggerResponse)

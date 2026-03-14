@@ -256,6 +256,10 @@ def parse_raw_events(raw_events: list[RawCapturedEvent]) -> ParseResult:
         try:
             if event.source == IngestionSource.GOOGLE_CONTACTS:
                 parsed.append(_parse_contact(event))
+            elif event.source == IngestionSource.LINKEDIN:
+                parsed.append(_parse_contact(event))
+            elif event.source == IngestionSource.CSV_IMPORT:
+                parsed.append(_parse_contact(event))
             elif event.source == IngestionSource.GMAIL:
                 parsed.append(_parse_gmail(event))
             elif event.source == IngestionSource.GOOGLE_CALENDAR:
@@ -278,4 +282,3 @@ def parse_raw_events(raw_events: list[RawCapturedEvent]) -> ParseResult:
             )
 
     return ParseResult(parsed_events=parsed, failures=failures)
-
