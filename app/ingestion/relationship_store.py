@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.ingestion.db import get_connection
 from app.ingestion.relationship_extraction import InteractionCandidate, RelationshipAggregate
 
 
@@ -49,7 +50,7 @@ class SqliteRelationshipStore(RelationshipStore):
     def _ensure_db(self) -> None:
         target = Path(self._db_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path) as conn:
+        with get_connection(self._db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS interaction_facts (
@@ -90,7 +91,7 @@ class SqliteRelationshipStore(RelationshipStore):
         relationships: list[RelationshipAggregate],
     ) -> RelationshipPersistResult:
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 for item in interactions:
                     conn.execute(
                         """
@@ -286,7 +287,4 @@ class SupabaseRelationshipStore(RelationshipStore):
 
 
 def create_relationship_store(settings: Settings) -> RelationshipStore:
-    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
-        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
-        return SupabaseRelationshipStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqliteRelationshipStore(db_path=settings.pipeline_db_path)

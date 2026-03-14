@@ -10,6 +10,7 @@ from threading import Lock
 import httpx
 
 from app.core.config import Settings
+from app.ingestion.db import get_connection
 from app.ingestion.embeddings import EmbeddingVectorRecord
 
 
@@ -43,7 +44,7 @@ class SqliteEmbeddingStore(EmbeddingStore):
     def _ensure_db(self) -> None:
         target = Path(self._db_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path) as conn:
+        with get_connection(self._db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS entities (
@@ -78,7 +79,7 @@ class SqliteEmbeddingStore(EmbeddingStore):
         persisted = 0
         skipped = 0
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 for item in records:
                     if not item.primary_email:
                         skipped += 1
@@ -221,7 +222,4 @@ class SupabaseEmbeddingStore(EmbeddingStore):
 
 
 def create_embedding_store(settings: Settings) -> EmbeddingStore:
-    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
-        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
-        return SupabaseEmbeddingStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqliteEmbeddingStore(db_path=settings.pipeline_db_path)

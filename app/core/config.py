@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     step_payloads_db_path: str = "data/step_payloads.db"
     parser_version: str = "v1"
 
+    turso_url: str = ""
+    turso_auth_token: str = ""
+
     supabase_url: str = ""
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""

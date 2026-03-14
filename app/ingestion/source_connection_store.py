@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.ingestion.db import get_connection
 from app.schemas import IngestionSource
 
 
@@ -53,7 +54,7 @@ class SqliteSourceConnectionStore(SourceConnectionStore):
     def _ensure_db(self) -> None:
         target = Path(self._db_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path) as conn:
+        with get_connection(self._db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS source_connections (
@@ -81,7 +82,7 @@ class SqliteSourceConnectionStore(SourceConnectionStore):
             return 0
         now = datetime.now(UTC).isoformat()
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 for rec in records:
                     conn.execute(
                         """
@@ -171,10 +172,4 @@ class SupabaseSourceConnectionStore(SourceConnectionStore):
 
 
 def create_source_connection_store(settings: Settings) -> SourceConnectionStore:
-    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
-        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
-        return SupabaseSourceConnectionStore(
-            supabase_url=settings.supabase_url,
-            api_key=api_key,
-        )
     return SqliteSourceConnectionStore(db_path=settings.pipeline_db_path)

@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from abc import ABC, abstractmethod
+from app.ingestion.db import get_connection
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -105,7 +106,7 @@ class SqliteStepPayloadStore(StepPayloadStore):
     def _ensure_db(self) -> None:
         target = Path(self._db_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path) as conn:
+        with get_connection(self._db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS step_payloads (
@@ -128,7 +129,7 @@ class SqliteStepPayloadStore(StepPayloadStore):
         created_at = datetime.now(UTC).isoformat()
         payload_json = json.dumps(payload, ensure_ascii=True)
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 conn.execute(
                     """
                     INSERT INTO step_payloads (run_id, step_name, payload_json, created_at)
@@ -145,7 +146,7 @@ class SqliteStepPayloadStore(StepPayloadStore):
     def read(self, step_ref: str) -> dict[str, Any]:
         run_id, step_name = _parse_ref(step_ref)
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     "SELECT payload_json FROM step_payloads "
@@ -159,7 +160,7 @@ class SqliteStepPayloadStore(StepPayloadStore):
     def delete(self, step_ref: str) -> None:
         run_id, step_name = _parse_ref(step_ref)
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 conn.execute(
                     "DELETE FROM step_payloads WHERE run_id = ? AND step_name = ?",
                     (run_id, step_name),
@@ -274,14 +275,4 @@ class SupabaseStepPayloadStore(StepPayloadStore):
 # ---------------------------------------------------------------------------
 
 def create_step_payload_store(settings: Settings) -> StepPayloadStore:
-    """Return the appropriate backend based on the current settings."""
-    if settings.supabase_url and (
-        settings.supabase_service_role_key or settings.supabase_anon_key
-    ):
-        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
-        return SupabaseStepPayloadStore(
-            supabase_url=settings.supabase_url,
-            api_key=api_key,
-            table=settings.supabase_step_payloads_table,
-        )
     return SqliteStepPayloadStore(db_path=settings.step_payloads_db_path)

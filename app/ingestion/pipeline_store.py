@@ -13,6 +13,7 @@ from uuid import uuid4
 import httpx
 
 from app.core.config import Settings
+from app.ingestion.db import get_connection
 from app.schemas import IngestionSource
 
 
@@ -111,7 +112,7 @@ class SqlitePipelineStore(PipelineStore):
     def _ensure_db(self) -> None:
         target = Path(self._db_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path) as conn:
+        with get_connection(self._db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS tenants (
@@ -189,7 +190,7 @@ class SqlitePipelineStore(PipelineStore):
     def ensure_tenant_user(self, tenant_id: str, user_id: str) -> None:
         now = _utc_now().isoformat()
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 conn.execute(
                     """
                     INSERT INTO tenants (tenant_id, name, created_at, updated_at)
@@ -221,7 +222,7 @@ class SqlitePipelineStore(PipelineStore):
     ) -> str:
         now = _utc_now().isoformat()
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 existing = conn.execute(
                     """
                     SELECT run_id
@@ -289,7 +290,7 @@ class SqlitePipelineStore(PipelineStore):
     ) -> None:
         now = _utc_now().isoformat()
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 conn.execute(
                     """
                     UPDATE pipeline_runs
@@ -317,7 +318,7 @@ class SqlitePipelineStore(PipelineStore):
     ) -> int:
         now = _utc_now().isoformat()
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 cursor = conn.execute(
                     """
                     INSERT INTO pipeline_stage_runs (
@@ -363,7 +364,7 @@ class SqlitePipelineStore(PipelineStore):
         del llm
         now = _utc_now().isoformat()
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 row = conn.execute(
                     "SELECT started_at FROM pipeline_stage_runs WHERE id = ?",
                     (stage_run_id,),
@@ -391,7 +392,7 @@ class SqlitePipelineStore(PipelineStore):
 
     def get_run_by_trace_id(self, trace_id: str) -> PipelineRunRecord | None:
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     """
@@ -790,7 +791,4 @@ class SupabasePipelineStore(PipelineStore):
 
 
 def create_pipeline_store(settings: Settings) -> PipelineStore:
-    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
-        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
-        return SupabasePipelineStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqlitePipelineStore(db_path=settings.pipeline_db_path)

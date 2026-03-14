@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.ingestion.db import get_connection
 from app.schemas import IngestionSource, RawCapturedEvent, SourceEvent
 
 
@@ -64,7 +65,7 @@ class SqliteRawEventStore(RawEventStore):
     def _ensure_db(self) -> None:
         target = Path(self._db_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path) as conn:
+        with get_connection(self._db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS raw_events (
@@ -130,7 +131,7 @@ class SqliteRawEventStore(RawEventStore):
             for event in events
         ]
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 conn.executemany(
                     """
                     INSERT INTO raw_events (
@@ -145,7 +146,7 @@ class SqliteRawEventStore(RawEventStore):
 
     def list_by_trace_id(self, trace_id: str) -> list[RawCapturedEvent]:
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute(
                     """
@@ -308,11 +309,4 @@ class SupabaseRawEventStore(RawEventStore):
 
 
 def create_raw_event_store(settings: Settings) -> RawEventStore:
-    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
-        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
-        return SupabaseRawEventStore(
-            supabase_url=settings.supabase_url,
-            api_key=api_key,
-            table=settings.supabase_raw_events_table,
-        )
     return SqliteRawEventStore(db_path=settings.raw_events_db_path)

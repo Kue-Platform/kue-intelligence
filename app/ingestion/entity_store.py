@@ -13,6 +13,7 @@ from uuid import uuid4
 import httpx
 
 from app.core.config import Settings
+from app.ingestion.db import get_connection
 from app.ingestion.entity_resolution import EntityCandidate
 from app.ingestion.metadata_extraction import MetadataCandidate
 
@@ -53,7 +54,7 @@ class SqliteEntityStore(EntityStore):
     def _ensure_db(self) -> None:
         target = Path(self._db_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path) as conn:
+        with get_connection(self._db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS entities (
@@ -143,7 +144,7 @@ class SqliteEntityStore(EntityStore):
         identities = 0
         now = datetime.now(UTC).isoformat()
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 for entity in resolved_entities:
                     entity_id = self._find_entity_id(
                         conn,
@@ -231,7 +232,7 @@ class SqliteEntityStore(EntityStore):
         updated = 0
         now = datetime.now(UTC).isoformat()
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 for item in metadata_candidates:
                     row = conn.execute(
@@ -525,7 +526,4 @@ class SupabaseEntityStore(EntityStore):
 
 
 def create_entity_store(settings: Settings) -> EntityStore:
-    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
-        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
-        return SupabaseEntityStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqliteEntityStore(db_path=settings.pipeline_db_path)

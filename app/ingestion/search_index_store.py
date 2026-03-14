@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.ingestion.db import get_connection
 from app.ingestion.search_indexing import HybridSignal
 
 
@@ -48,7 +49,7 @@ class SqliteSearchIndexStore(SearchIndexStore):
     def _ensure_db(self) -> None:
         target = Path(self._db_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path) as conn:
+        with get_connection(self._db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS entities (
@@ -79,7 +80,7 @@ class SqliteSearchIndexStore(SearchIndexStore):
         applied = 0
         skipped = 0
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 for signal in signals:
                     if not signal.primary_email:
@@ -131,7 +132,7 @@ class SqliteSearchIndexStore(SearchIndexStore):
 
     def health_check(self, tenant_id: str) -> dict[str, Any]:
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 total_docs = conn.execute(
                     "SELECT count(*) FROM search_documents WHERE tenant_id = ?",
                     (tenant_id,),
@@ -337,7 +338,4 @@ class SupabaseSearchIndexStore(SearchIndexStore):
 
 
 def create_search_index_store(settings: Settings) -> SearchIndexStore:
-    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
-        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
-        return SupabaseSearchIndexStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqliteSearchIndexStore(db_path=settings.pipeline_db_path)

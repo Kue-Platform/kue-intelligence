@@ -12,6 +12,7 @@ from uuid import uuid4
 import httpx
 
 from app.core.config import Settings
+from app.ingestion.db import get_connection
 from app.ingestion.semantic_prep import SemanticDocument
 
 
@@ -46,7 +47,7 @@ class SqliteSearchDocumentStore(SearchDocumentStore):
     def _ensure_db(self) -> None:
         target = Path(self._db_path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self._db_path) as conn:
+        with get_connection(self._db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS entities (
@@ -79,7 +80,7 @@ class SqliteSearchDocumentStore(SearchDocumentStore):
         stored = 0
         skipped = 0
         with self._lock:
-            with sqlite3.connect(self._db_path) as conn:
+            with get_connection(self._db_path) as conn:
                 for doc in documents:
                     if not doc.primary_email:
                         skipped += 1
@@ -218,7 +219,4 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
 
 
 def create_search_document_store(settings: Settings) -> SearchDocumentStore:
-    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
-        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
-        return SupabaseSearchDocumentStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqliteSearchDocumentStore(db_path=settings.pipeline_db_path)

@@ -21,3 +21,4 @@ env/
 
 # Project specific
 kue_intelligence.egg-info/
+*.db*
