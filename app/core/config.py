@@ -35,6 +35,16 @@ class Settings(BaseSettings):
     neo4j_password: str = ""
     neo4j_database: str = "neo4j"
     graph_projection_batch_size: int = 500
+    warm_path_max_hops: int = 3
+    warm_path_max_results: int = 20
+    warm_path_recency_halflife_days: float = 90.0
+    warm_path_hop_decay: float = 0.85
+    warm_path_cache_ttl_seconds: int = 300
+    warm_path_cache_max_size: int = 256
+    warm_path_large_network_threshold: int = 10000
+    warm_path_large_network_min_strength: float = 0.3
+    upstash_redis_rest_url: str = ""
+    upstash_redis_rest_token: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

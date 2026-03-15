@@ -294,3 +294,69 @@ class CsvImportResponse(BaseModel):
     mapping_mode: str
     warning_samples: list[str] = []
     status: str = "accepted"
+
+
+# ---------------------------------------------------------------------------
+# Warm Path
+# ---------------------------------------------------------------------------
+
+
+class WarmPathNode(BaseModel):
+    entity_id: str
+    name: str | None = None
+    primary_email: str | None = None
+    company: str | None = None
+
+
+class WarmPathEdge(BaseModel):
+    from_entity_id: str
+    to_entity_id: str
+    strength: float
+    interaction_count: int
+    last_interaction_at: str | None = None
+    channels: list[str] = []
+    edge_warmth: float
+
+
+class WarmPath(BaseModel):
+    path_nodes: list[WarmPathNode]
+    path_edges: list[WarmPathEdge]
+    path_score: float  # 0–100 scale
+    hop_count: int
+    is_direct: bool = False
+
+
+class WarmPathResponse(BaseModel):
+    tenant_id: str
+    origin_entity_id: str
+    target_entity_id: str | None = None
+    paths: list[WarmPath]
+    total_paths_found: int
+    query_mode: str  # "targeted" | "discover"
+
+
+class WarmPathOriginResponse(BaseModel):
+    tenant_id: str
+    email: str
+    entity_id: str | None = None
+    found: bool
+
+
+class WarmPathEventRequest(BaseModel):
+    event_type: str = Field(
+        ...,
+        description="Event type, e.g. 'path_selected', 'intro_requested'.",
+    )
+    origin_entity_id: str
+    target_entity_id: str
+    selected_path_score: float | None = None
+    selected_path_hop_count: int | None = None
+    connector_entity_ids: list[str] = []
+    metadata: dict[str, Any] = {}
+
+
+class WarmPathEventResponse(BaseModel):
+    tenant_id: str
+    event_id: str
+    event_type: str
+    recorded_at: datetime

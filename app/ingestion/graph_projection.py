@@ -330,6 +330,9 @@ class GraphProjectionService:
                 }
             )
 
+        # DEPRECATED: intro_path_edges are superseded by the query-time warm-path
+        # engine in app/ingestion/warm_path.py and the /v1/warm-path/ endpoints.
+        # Kept for backward compatibility; will be removed in a follow-up PR.
         intro_path_edges: list[dict[str, Any]] = []
         email_to_entity = {
             str(item.get("primary_email")).lower(): str(item.get("entity_id"))

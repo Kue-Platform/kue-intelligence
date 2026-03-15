@@ -2,6 +2,8 @@
 
 Kue Intelligence is a FastAPI + Inngest data-intelligence service that converts raw contact and communication signals into canonical records, entities, relationships, semantic documents, embeddings, hybrid search signals, and graph projections — all observable, replay-safe, and tenant-scoped.
 
+Focused ingestion documentation: [`docs/INGESTION_PIPELINE.md`](docs/INGESTION_PIPELINE.md)
+
 ---
 
 ## Table of Contents

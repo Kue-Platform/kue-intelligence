@@ -2,11 +2,13 @@ from fastapi import FastAPI
 import inngest.fast_api
 
 from app.api.ingestion_routes import router as ingestion_router
+from app.api.warm_path_routes import router as warm_path_router
 from app.core.config import settings
 from app.inngest.runtime import inngest_client, inngest_functions
 
 app = FastAPI(title=settings.app_name)
 app.include_router(ingestion_router)
+app.include_router(warm_path_router)
 inngest.fast_api.serve(app, inngest_client, inngest_functions)
 
 

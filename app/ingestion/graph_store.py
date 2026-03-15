@@ -33,6 +33,10 @@ class GraphStore(ABC):
     def verify(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
+    @abstractmethod
+    def run_read_query(self, query: str, **params: Any) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
 
 class NoopGraphStore(GraphStore):
     @property
@@ -70,6 +74,9 @@ class NoopGraphStore(GraphStore):
     def verify(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         del snapshot
         return {"enabled": False, "ok": True, "counts": {}, "mismatches": []}
+
+    def run_read_query(self, query: str, **params: Any) -> list[dict[str, Any]]:
+        return []
 
 
 class Neo4jGraphStore(GraphStore):
@@ -354,6 +361,11 @@ class Neo4jGraphStore(GraphStore):
             },
             "mismatches": mismatches,
         }
+
+    def run_read_query(self, query: str, **params: Any) -> list[dict[str, Any]]:
+        with self._driver.session(database=self._database) as session:
+            result = session.run(query, timeout=10.0, **params)
+            return [dict(r) for r in result]
 
 
 def create_graph_store(settings: Settings) -> GraphStore:
