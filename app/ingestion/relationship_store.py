@@ -61,7 +61,8 @@ class SqliteRelationshipStore(RelationshipStore):
                     touchpoint_type TEXT NOT NULL,
                     occurred_at TEXT NOT NULL,
                     topic TEXT,
-                    payload_json TEXT NOT NULL DEFAULT '{}'
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE (tenant_id, source, actor_email, target_email, touchpoint_type, occurred_at)
                 )
                 """
             )
@@ -97,6 +98,10 @@ class SqliteRelationshipStore(RelationshipStore):
                         INSERT INTO interaction_facts (
                             tenant_id, source, actor_email, target_email, touchpoint_type, occurred_at, topic, payload_json
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(tenant_id, source, actor_email, target_email, touchpoint_type, occurred_at)
+                        DO UPDATE SET
+                            topic=excluded.topic,
+                            payload_json=excluded.payload_json
                         """,
                         (
                             item.tenant_id,
@@ -236,6 +241,8 @@ class SupabaseRelationshipStore(RelationshipStore):
                 {
                     "tenant_id": item.tenant_id,
                     "source": item.source,
+                    "actor_email": item.actor_email,
+                    "target_email": item.target_email,
                     "touchpoint_type": item.touchpoint_type,
                     "occurred_at": item.occurred_at,
                     "topic": item.topic,
@@ -245,13 +252,17 @@ class SupabaseRelationshipStore(RelationshipStore):
             ]
             response = httpx.post(
                 self._url("interaction_facts"),
-                headers=self._base_headers,
+                headers={
+                    **self._base_headers,
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+                params={"on_conflict": "tenant_id,source,actor_email,target_email,touchpoint_type,occurred_at"},
                 json=payload,
                 timeout=30.0,
             )
             if response.status_code >= 400:
                 raise RuntimeError(
-                    f"Supabase interaction_facts insert failed ({response.status_code}): {response.text}"
+                    f"Supabase interaction_facts upsert failed ({response.status_code}): {response.text}"
                 )
 
         if not relationships:
