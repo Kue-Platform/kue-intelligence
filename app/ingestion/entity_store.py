@@ -807,4 +807,7 @@ class SupabaseEntityStore(EntityStore):
 
 
 def create_entity_store(settings: Settings) -> EntityStore:
+    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
+        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
+        return SupabaseEntityStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqliteEntityStore(db_path=settings.pipeline_db_path)

@@ -331,4 +331,7 @@ class SupabaseMergeCandidateStore(MergeCandidateStore):
 
 
 def create_merge_candidate_store(settings: Settings) -> MergeCandidateStore:
+    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
+        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
+        return SupabaseMergeCandidateStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqliteMergeCandidateStore(db_path=settings.pipeline_db_path)
