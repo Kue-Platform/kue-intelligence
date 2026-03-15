@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 
@@ -327,6 +327,11 @@ class SupabaseEntityStore(EntityStore):
             result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
         return result
 
+    @staticmethod
+    def _deterministic_entity_id(tenant_id: str, source: str, source_event_id: str) -> str:
+        """Stable entity_id for contacts without email so re-imports upsert instead of duplicating."""
+        return str(uuid5(NAMESPACE_URL, f"{tenant_id}:{source}:{source_event_id}"))
+
     def upsert_entities(self, resolved_entities: list[EntityCandidate]) -> EntityPersistResult:
         if not resolved_entities:
             return EntityPersistResult(0, 0, 0, 0)
@@ -339,19 +344,26 @@ class SupabaseEntityStore(EntityStore):
         total_created = total_updated = total_identities = 0
 
         for tenant_id, candidates in by_tenant.items():
-            # We still need entity_id values to write entity_identities rows.
             emails = [c.primary_email for c in candidates if c.primary_email]
             known_by_email = self._bulk_fetch_entities_by_email(tenant_id, emails)
 
-            # Split into new vs existing
-            new_candidates = [c for c in candidates if not known_by_email.get(c.primary_email)]
-            existing_candidates = [c for c in candidates if known_by_email.get(c.primary_email)]
-
+            # Split: email-matched → existing, has-email-but-new → insert, no-email → deterministic upsert
             entity_id_map: dict[str, str] = {}
-            for c in existing_candidates:
-                entity_id_map[c.source_event_id] = known_by_email[c.primary_email]
+            existing_candidates: list[EntityCandidate] = []
+            new_with_email: list[EntityCandidate] = []
+            new_without_email: list[EntityCandidate] = []
+            for c in candidates:
+                eid = known_by_email.get(c.primary_email) if c.primary_email else None
+                if eid:
+                    entity_id_map[c.source_event_id] = eid
+                    existing_candidates.append(c)
+                elif c.primary_email:
+                    new_with_email.append(c)
+                else:
+                    new_without_email.append(c)
 
-            if new_candidates:
+            # New entities with email — plain insert, get back auto-generated entity_ids
+            if new_with_email:
                 ins_resp = httpx.post(
                     self._url("entities"),
                     headers={**self._base_headers, "Prefer": "return=representation"},
@@ -364,7 +376,7 @@ class SupabaseEntityStore(EntityStore):
                             "title_norm": c.title_norm,
                             "metadata_json": c.metadata_json,
                         }
-                        for c in new_candidates
+                        for c in new_with_email
                     ],
                     timeout=30.0,
                 )
@@ -373,11 +385,41 @@ class SupabaseEntityStore(EntityStore):
                         f"Supabase entities bulk insert failed ({ins_resp.status_code}): {ins_resp.text}"
                     )
                 returned = {row.get("primary_email"): str(row["entity_id"]) for row in ins_resp.json()}
-                for c in new_candidates:
+                for c in new_with_email:
                     eid = returned.get(c.primary_email)
                     if eid:
                         entity_id_map[c.source_event_id] = eid
                         total_created += 1
+
+            # No-email entities — deterministic entity_id so re-imports upsert on entity_id
+            if new_without_email:
+                no_email_rows = [
+                    {
+                        "entity_id": self._deterministic_entity_id(c.tenant_id, c.source, c.source_event_id),
+                        "tenant_id": c.tenant_id,
+                        "display_name": c.display_name,
+                        "primary_email": None,
+                        "company_norm": c.company_norm,
+                        "title_norm": c.title_norm,
+                        "metadata_json": c.metadata_json,
+                    }
+                    for c in new_without_email
+                ]
+                upsert_resp = httpx.post(
+                    self._url("entities"),
+                    headers=self._upsert_headers,
+                    params={"on_conflict": "entity_id"},
+                    json=no_email_rows,
+                    timeout=30.0,
+                )
+                if upsert_resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"Supabase entities no-email upsert failed ({upsert_resp.status_code}): {upsert_resp.text}"
+                    )
+                for c in new_without_email:
+                    det_id = self._deterministic_entity_id(c.tenant_id, c.source, c.source_event_id)
+                    entity_id_map[c.source_event_id] = det_id
+                    total_created += 1
 
             # Deduplicate by entity_id: multiple candidates can map to the same entity
             # (e.g. same contact in Gmail + calendar). Postgres raises PG21000 if

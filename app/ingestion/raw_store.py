@@ -91,6 +91,23 @@ class SqliteRawEventStore(RawEventStore):
                 conn.execute("ALTER TABLE raw_events ADD COLUMN headers_json TEXT NOT NULL DEFAULT '{}'")
             if "ingest_version" not in columns:
                 conn.execute("ALTER TABLE raw_events ADD COLUMN ingest_version TEXT NOT NULL DEFAULT 'v1'")
+            # Remove pre-existing duplicates before creating the unique index.
+            conn.execute(
+                """
+                DELETE FROM raw_events
+                WHERE rowid NOT IN (
+                    SELECT MIN(rowid)
+                    FROM raw_events
+                    GROUP BY tenant_id, user_id, source, source_event_id
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_events_dedup
+                ON raw_events(tenant_id, user_id, source, source_event_id)
+                """
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_raw_events_trace_id ON raw_events(trace_id)"
             )
@@ -137,6 +154,15 @@ class SqliteRawEventStore(RawEventStore):
                         tenant_id, user_id, source, source_event_id, occurred_at,
                         trace_id, run_id, headers_json, ingest_version, payload_json, captured_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(tenant_id, user_id, source, source_event_id)
+                    DO UPDATE SET
+                        occurred_at=excluded.occurred_at,
+                        trace_id=excluded.trace_id,
+                        run_id=excluded.run_id,
+                        headers_json=excluded.headers_json,
+                        ingest_version=excluded.ingest_version,
+                        payload_json=excluded.payload_json,
+                        captured_at=excluded.captured_at
                     """,
                     rows,
                 )

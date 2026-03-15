@@ -168,14 +168,22 @@ class SupabaseRelationshipStore(RelationshipStore):
         body = (response.text or "").lower()
         return response.status_code == 409 or "23505" in body
 
-    def _bulk_resolve_entity_ids(self, tenant_id: str, emails: list[str]) -> dict[str, str]:
-        """Return {email -> entity_id} for all given emails in one GET."""
-        if not emails:
+    def _bulk_resolve_entity_ids(self, tenant_id: str, identifiers: list[str]) -> dict[str, str]:
+        """Return {identifier -> entity_id} for all given identifiers.
+
+        First attempts to match by ``primary_email``.  For any identifiers
+        that remain unresolved (e.g. LinkedIn names like "jane doe") a
+        second pass matches by ``display_name`` (case-insensitive via
+        ``ilike``).
+        """
+        if not identifiers:
             return {}
-        unique_emails = list(set(emails))
+        unique = list(set(identifiers))
         result: dict[str, str] = {}
-        for i in range(0, len(unique_emails), 50):
-            chunk = unique_emails[i:i + 50]
+
+        # Pass 1: match by primary_email
+        for i in range(0, len(unique), 50):
+            chunk = unique[i:i + 50]
             response = httpx.get(
                 self._url("entities"),
                 headers=self._base_headers,
@@ -191,6 +199,31 @@ class SupabaseRelationshipStore(RelationshipStore):
                     f"Supabase entities bulk lookup failed ({response.status_code}): {response.text}"
                 )
             result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
+
+        # Pass 2: for unresolved identifiers, try matching by display_name
+        unresolved = [ident for ident in unique if ident not in result]
+        if unresolved:
+            for i in range(0, len(unresolved), 50):
+                chunk = unresolved[i:i + 50]
+                # Use ilike for case-insensitive name matching
+                or_filter = ",".join(f"display_name.ilike.{name}" for name in chunk)
+                response = httpx.get(
+                    self._url("entities"),
+                    headers=self._base_headers,
+                    params={
+                        "tenant_id": f"eq.{tenant_id}",
+                        "or": f"({or_filter})",
+                        "select": "display_name,entity_id",
+                    },
+                    timeout=30.0,
+                )
+                if response.status_code >= 400:
+                    continue  # best-effort; don't fail the whole persist
+                for row in response.json():
+                    name_lower = str(row["display_name"]).strip().lower()
+                    if name_lower not in result:
+                        result[name_lower] = str(row["entity_id"])
+
         return result
 
     def persist(
