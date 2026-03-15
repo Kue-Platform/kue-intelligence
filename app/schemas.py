@@ -184,6 +184,7 @@ class Layer6EntityResolutionResponse(BaseModel):
     created_entities: int
     updated_entities: int
     identities_upserted: int
+    merge_candidate_count: int = 0
     store: str
 
 

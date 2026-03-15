@@ -8,12 +8,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import uuid4
 
 import httpx
 
 from app.core.config import Settings
-from app.ingestion.entity_resolution import EntityCandidate
+from app.ingestion.entity_resolution import EntityCandidate, _normalize_phone
 from app.ingestion.metadata_extraction import MetadataCandidate
 
 
@@ -23,6 +23,15 @@ class EntityPersistResult:
     created_entities: int
     updated_entities: int
     identities_upserted: int
+
+
+@dataclass
+class MergeExecutionResult:
+    surviving_entity_id: str
+    merged_entity_id: str
+    identities_moved: int
+    relationships_repointed: int
+    search_docs_repointed: int
 
 
 class EntityStore(ABC):
@@ -37,6 +46,12 @@ class EntityStore(ABC):
 
     @abstractmethod
     def upsert_metadata(self, metadata_candidates: list[MetadataCandidate]) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def execute_merge(
+        self, *, tenant_id: str, surviving_entity_id: str, merged_entity_id: str
+    ) -> MergeExecutionResult:
         raise NotImplementedError
 
 
@@ -64,11 +79,23 @@ class SqliteEntityStore(EntityStore):
                     company_norm TEXT,
                     title_norm TEXT,
                     metadata_json TEXT NOT NULL DEFAULT '{}',
+                    phones_json TEXT DEFAULT '[]',
+                    secondary_emails_json TEXT DEFAULT '[]',
+                    linkedin_url TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            # Column migrations for existing DBs
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(entities)").fetchall()}
+            if "phones_json" not in columns:
+                conn.execute("ALTER TABLE entities ADD COLUMN phones_json TEXT DEFAULT '[]'")
+            if "secondary_emails_json" not in columns:
+                conn.execute("ALTER TABLE entities ADD COLUMN secondary_emails_json TEXT DEFAULT '[]'")
+            if "linkedin_url" not in columns:
+                conn.execute("ALTER TABLE entities ADD COLUMN linkedin_url TEXT")
+
             conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_tenant_email
@@ -107,7 +134,9 @@ class SqliteEntityStore(EntityStore):
         source: str,
         source_event_id: str,
         primary_email: str | None,
+        candidate: EntityCandidate | None = None,
     ) -> str | None:
+        # 1. Exact source identity match
         row = conn.execute(
             """
             SELECT entity_id
@@ -120,6 +149,7 @@ class SqliteEntityStore(EntityStore):
         if row:
             return str(row[0])
 
+        # 2. Primary email match
         if primary_email:
             row = conn.execute(
                 """
@@ -132,6 +162,64 @@ class SqliteEntityStore(EntityStore):
             ).fetchone()
             if row:
                 return str(row[0])
+
+        if candidate is None:
+            return None
+
+        # 3. LinkedIn URL match
+        linkedin_url = getattr(candidate, "linkedin_url", None)
+        if linkedin_url:
+            row = conn.execute(
+                """
+                SELECT entity_id
+                FROM entities
+                WHERE tenant_id = ? AND linkedin_url = ?
+                LIMIT 1
+                """,
+                (tenant_id, linkedin_url),
+            ).fetchone()
+            if row:
+                return str(row[0])
+
+        # 4. Phone match (normalized last-10-digits)
+        for phone in getattr(candidate, "phones", []):
+            norm = _normalize_phone(phone)
+            if not norm:
+                continue
+            # Search phones_json for the normalized digits
+            rows = conn.execute(
+                """
+                SELECT entity_id, phones_json
+                FROM entities
+                WHERE tenant_id = ? AND phones_json != '[]'
+                """,
+                (tenant_id,),
+            ).fetchall()
+            for r in rows:
+                try:
+                    stored_phones = json.loads(r[1] or "[]")
+                except json.JSONDecodeError:
+                    continue
+                for sp in stored_phones:
+                    if _normalize_phone(str(sp)) == norm:
+                        return str(r[0])
+
+        # 5. Name + company match
+        name_norm = getattr(candidate, "name_norm", None)
+        company_norm = getattr(candidate, "company_norm", None)
+        if name_norm and company_norm:
+            row = conn.execute(
+                """
+                SELECT entity_id
+                FROM entities
+                WHERE tenant_id = ? AND lower(display_name) = ? AND company_norm = ?
+                LIMIT 1
+                """,
+                (tenant_id, name_norm, company_norm),
+            ).fetchone()
+            if row:
+                return str(row[0])
+
         return None
 
     def upsert_entities(self, resolved_entities: list[EntityCandidate]) -> EntityPersistResult:
@@ -151,6 +239,7 @@ class SqliteEntityStore(EntityStore):
                         source=entity.source,
                         source_event_id=entity.source_event_id,
                         primary_email=entity.primary_email,
+                        candidate=entity,
                     )
                     if entity_id is None:
                         entity_id = str(uuid4())
@@ -158,8 +247,9 @@ class SqliteEntityStore(EntityStore):
                             """
                             INSERT INTO entities (
                                 entity_id, tenant_id, display_name, primary_email, company_norm, title_norm,
-                                metadata_json, created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                metadata_json, phones_json, secondary_emails_json, linkedin_url,
+                                created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 entity_id,
@@ -169,6 +259,9 @@ class SqliteEntityStore(EntityStore):
                                 entity.company_norm,
                                 entity.title_norm,
                                 json.dumps(entity.metadata_json, ensure_ascii=True),
+                                json.dumps(getattr(entity, "phones", [])),
+                                json.dumps(getattr(entity, "secondary_emails", [])),
+                                getattr(entity, "linkedin_url", None),
                                 now,
                                 now,
                             ),
@@ -181,7 +274,11 @@ class SqliteEntityStore(EntityStore):
                             SET display_name = ?, primary_email = coalesce(?, primary_email),
                                 company_norm = coalesce(?, company_norm),
                                 title_norm = coalesce(?, title_norm),
-                                metadata_json = ?, updated_at = ?
+                                metadata_json = ?,
+                                phones_json = ?,
+                                secondary_emails_json = ?,
+                                linkedin_url = coalesce(?, linkedin_url),
+                                updated_at = ?
                             WHERE entity_id = ?
                             """,
                             (
@@ -190,6 +287,9 @@ class SqliteEntityStore(EntityStore):
                                 entity.company_norm,
                                 entity.title_norm,
                                 json.dumps(entity.metadata_json, ensure_ascii=True),
+                                json.dumps(getattr(entity, "phones", [])),
+                                json.dumps(getattr(entity, "secondary_emails", [])),
+                                getattr(entity, "linkedin_url", None),
                                 now,
                                 entity_id,
                             ),
@@ -274,6 +374,123 @@ class SqliteEntityStore(EntityStore):
                 conn.commit()
         return updated
 
+    def execute_merge(
+        self, *, tenant_id: str, surviving_entity_id: str, merged_entity_id: str
+    ) -> MergeExecutionResult:
+        identities_moved = 0
+        relationships_repointed = 0
+        search_docs_repointed = 0
+        now = datetime.now(UTC).isoformat()
+
+        with self._lock:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+
+                # Snapshot merged entity for rollback log
+                merged_row = conn.execute(
+                    "SELECT * FROM entities WHERE entity_id = ? AND tenant_id = ?",
+                    (merged_entity_id, tenant_id),
+                ).fetchone()
+                if not merged_row:
+                    return MergeExecutionResult(
+                        surviving_entity_id=surviving_entity_id,
+                        merged_entity_id=merged_entity_id,
+                        identities_moved=0,
+                        relationships_repointed=0,
+                        search_docs_repointed=0,
+                    )
+
+                # Coalesce null fields on surviving entity from merged entity
+                conn.execute(
+                    """
+                    UPDATE entities
+                    SET primary_email = coalesce(primary_email, ?),
+                        company_norm = coalesce(company_norm, ?),
+                        title_norm = coalesce(title_norm, ?),
+                        linkedin_url = coalesce(linkedin_url, ?),
+                        updated_at = ?
+                    WHERE entity_id = ? AND tenant_id = ?
+                    """,
+                    (
+                        merged_row["primary_email"],
+                        merged_row["company_norm"],
+                        merged_row["title_norm"],
+                        merged_row["linkedin_url"],
+                        now,
+                        surviving_entity_id,
+                        tenant_id,
+                    ),
+                )
+
+                # Re-point entity_identities
+                conn.execute(
+                    """
+                    UPDATE entity_identities
+                    SET entity_id = ?
+                    WHERE entity_id = ? AND tenant_id = ?
+                    """,
+                    (surviving_entity_id, merged_entity_id, tenant_id),
+                )
+                identities_moved = conn.execute("SELECT changes()").fetchone()[0]
+
+                # Re-point search_documents (if table exists)
+                try:
+                    conn.execute(
+                        """
+                        UPDATE search_documents
+                        SET entity_id = ?
+                        WHERE entity_id = ? AND tenant_id = ?
+                        """,
+                        (surviving_entity_id, merged_entity_id, tenant_id),
+                    )
+                    search_docs_repointed = conn.execute("SELECT changes()").fetchone()[0]
+                except sqlite3.OperationalError:
+                    pass  # table may not exist yet
+
+                # Re-point relationships (both directions)
+                for col in ("from_entity_id", "to_entity_id"):
+                    try:
+                        conn.execute(
+                            f"""
+                            UPDATE relationships
+                            SET {col} = ?
+                            WHERE {col} = ? AND tenant_id = ?
+                            """,
+                            (surviving_entity_id, merged_entity_id, tenant_id),
+                        )
+                        relationships_repointed += conn.execute("SELECT changes()").fetchone()[0]
+                    except sqlite3.OperationalError:
+                        pass  # table may not exist yet
+
+                # Delete duplicate relationships that now have same (from, to, type)
+                try:
+                    conn.execute(
+                        """
+                        DELETE FROM relationships
+                        WHERE rowid NOT IN (
+                            SELECT MIN(rowid) FROM relationships
+                            GROUP BY tenant_id, from_entity_id, to_entity_id, relationship_type
+                        )
+                        """
+                    )
+                except sqlite3.OperationalError:
+                    pass
+
+                # Remove merged entity
+                conn.execute(
+                    "DELETE FROM entities WHERE entity_id = ? AND tenant_id = ?",
+                    (merged_entity_id, tenant_id),
+                )
+                conn.commit()
+
+        return MergeExecutionResult(
+            surviving_entity_id=surviving_entity_id,
+            merged_entity_id=merged_entity_id,
+            identities_moved=identities_moved,
+            relationships_repointed=relationships_repointed,
+            search_docs_repointed=search_docs_repointed,
+        )
+
 
 class SupabaseEntityStore(EntityStore):
     def __init__(self, *, supabase_url: str, api_key: str) -> None:
@@ -327,11 +544,6 @@ class SupabaseEntityStore(EntityStore):
             result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
         return result
 
-    @staticmethod
-    def _deterministic_entity_id(tenant_id: str, source: str, source_event_id: str) -> str:
-        """Stable entity_id for contacts without email so re-imports upsert instead of duplicating."""
-        return str(uuid5(NAMESPACE_URL, f"{tenant_id}:{source}:{source_event_id}"))
-
     def upsert_entities(self, resolved_entities: list[EntityCandidate]) -> EntityPersistResult:
         if not resolved_entities:
             return EntityPersistResult(0, 0, 0, 0)
@@ -344,26 +556,19 @@ class SupabaseEntityStore(EntityStore):
         total_created = total_updated = total_identities = 0
 
         for tenant_id, candidates in by_tenant.items():
+            # We still need entity_id values to write entity_identities rows.
             emails = [c.primary_email for c in candidates if c.primary_email]
             known_by_email = self._bulk_fetch_entities_by_email(tenant_id, emails)
 
-            # Split: email-matched → existing, has-email-but-new → insert, no-email → deterministic upsert
-            entity_id_map: dict[str, str] = {}
-            existing_candidates: list[EntityCandidate] = []
-            new_with_email: list[EntityCandidate] = []
-            new_without_email: list[EntityCandidate] = []
-            for c in candidates:
-                eid = known_by_email.get(c.primary_email) if c.primary_email else None
-                if eid:
-                    entity_id_map[c.source_event_id] = eid
-                    existing_candidates.append(c)
-                elif c.primary_email:
-                    new_with_email.append(c)
-                else:
-                    new_without_email.append(c)
+            # Split into new vs existing
+            new_candidates = [c for c in candidates if not known_by_email.get(c.primary_email)]
+            existing_candidates = [c for c in candidates if known_by_email.get(c.primary_email)]
 
-            # New entities with email — plain insert, get back auto-generated entity_ids
-            if new_with_email:
+            entity_id_map: dict[str, str] = {}
+            for c in existing_candidates:
+                entity_id_map[c.source_event_id] = known_by_email[c.primary_email]
+
+            if new_candidates:
                 ins_resp = httpx.post(
                     self._url("entities"),
                     headers={**self._base_headers, "Prefer": "return=representation"},
@@ -375,8 +580,11 @@ class SupabaseEntityStore(EntityStore):
                             "company_norm": c.company_norm,
                             "title_norm": c.title_norm,
                             "metadata_json": c.metadata_json,
+                            "phones": getattr(c, "phones", []),
+                            "secondary_emails": getattr(c, "secondary_emails", []),
+                            "linkedin_url": getattr(c, "linkedin_url", None),
                         }
-                        for c in new_with_email
+                        for c in new_candidates
                     ],
                     timeout=30.0,
                 )
@@ -385,41 +593,11 @@ class SupabaseEntityStore(EntityStore):
                         f"Supabase entities bulk insert failed ({ins_resp.status_code}): {ins_resp.text}"
                     )
                 returned = {row.get("primary_email"): str(row["entity_id"]) for row in ins_resp.json()}
-                for c in new_with_email:
+                for c in new_candidates:
                     eid = returned.get(c.primary_email)
                     if eid:
                         entity_id_map[c.source_event_id] = eid
                         total_created += 1
-
-            # No-email entities — deterministic entity_id so re-imports upsert on entity_id
-            if new_without_email:
-                no_email_rows = [
-                    {
-                        "entity_id": self._deterministic_entity_id(c.tenant_id, c.source, c.source_event_id),
-                        "tenant_id": c.tenant_id,
-                        "display_name": c.display_name,
-                        "primary_email": None,
-                        "company_norm": c.company_norm,
-                        "title_norm": c.title_norm,
-                        "metadata_json": c.metadata_json,
-                    }
-                    for c in new_without_email
-                ]
-                upsert_resp = httpx.post(
-                    self._url("entities"),
-                    headers=self._upsert_headers,
-                    params={"on_conflict": "entity_id"},
-                    json=no_email_rows,
-                    timeout=30.0,
-                )
-                if upsert_resp.status_code >= 400:
-                    raise RuntimeError(
-                        f"Supabase entities no-email upsert failed ({upsert_resp.status_code}): {upsert_resp.text}"
-                    )
-                for c in new_without_email:
-                    det_id = self._deterministic_entity_id(c.tenant_id, c.source, c.source_event_id)
-                    entity_id_map[c.source_event_id] = det_id
-                    total_created += 1
 
             # Deduplicate by entity_id: multiple candidates can map to the same entity
             # (e.g. same contact in Gmail + calendar). Postgres raises PG21000 if
@@ -438,6 +616,9 @@ class SupabaseEntityStore(EntityStore):
                         "company_norm": c.company_norm,
                         "title_norm": c.title_norm,
                         "metadata_json": c.metadata_json,
+                        "phones": getattr(c, "phones", []),
+                        "secondary_emails": getattr(c, "secondary_emails", []),
+                        "linkedin_url": getattr(c, "linkedin_url", None),
                     }
                 update_rows = list(deduped_entities.values())
 
@@ -565,9 +746,65 @@ class SupabaseEntityStore(EntityStore):
 
         return updated
 
+    def execute_merge(
+        self, *, tenant_id: str, surviving_entity_id: str, merged_entity_id: str
+    ) -> MergeExecutionResult:
+        identities_moved = 0
+        relationships_repointed = 0
+        search_docs_repointed = 0
+
+        # Re-point entity_identities
+        resp = httpx.patch(
+            self._url("entity_identities"),
+            headers=self._base_headers,
+            params={"entity_id": f"eq.{merged_entity_id}", "tenant_id": f"eq.{tenant_id}"},
+            json={"entity_id": surviving_entity_id},
+            timeout=30.0,
+        )
+        if resp.status_code < 400:
+            identities_moved = int(resp.headers.get("content-range", "0").split("/")[-1] or 0)
+
+        # Re-point search_documents
+        resp = httpx.patch(
+            self._url("search_documents"),
+            headers=self._base_headers,
+            params={"entity_id": f"eq.{merged_entity_id}", "tenant_id": f"eq.{tenant_id}"},
+            json={"entity_id": surviving_entity_id},
+            timeout=30.0,
+        )
+        if resp.status_code < 400:
+            search_docs_repointed = int(resp.headers.get("content-range", "0").split("/")[-1] or 0)
+
+        # Re-point relationships (both FK columns)
+        for col in ("from_entity_id", "to_entity_id"):
+            resp = httpx.patch(
+                self._url("relationships"),
+                headers=self._base_headers,
+                params={col: f"eq.{merged_entity_id}", "tenant_id": f"eq.{tenant_id}"},
+                json={col: surviving_entity_id},
+                timeout=30.0,
+            )
+            if resp.status_code < 400:
+                relationships_repointed += int(
+                    resp.headers.get("content-range", "0").split("/")[-1] or 0
+                )
+
+        # Delete merged entity
+        httpx.delete(
+            self._url("entities"),
+            headers=self._base_headers,
+            params={"entity_id": f"eq.{merged_entity_id}", "tenant_id": f"eq.{tenant_id}"},
+            timeout=30.0,
+        )
+
+        return MergeExecutionResult(
+            surviving_entity_id=surviving_entity_id,
+            merged_entity_id=merged_entity_id,
+            identities_moved=identities_moved,
+            relationships_repointed=relationships_repointed,
+            search_docs_repointed=search_docs_repointed,
+        )
+
 
 def create_entity_store(settings: Settings) -> EntityStore:
-    if settings.supabase_url and (settings.supabase_service_role_key or settings.supabase_anon_key):
-        api_key = settings.supabase_service_role_key or settings.supabase_anon_key
-        return SupabaseEntityStore(supabase_url=settings.supabase_url, api_key=api_key)
     return SqliteEntityStore(db_path=settings.pipeline_db_path)

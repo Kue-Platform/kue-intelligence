@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     neo4j_password: str = ""
     neo4j_database: str = "neo4j"
     graph_projection_batch_size: int = 500
+    entity_merge_auto_threshold: float = 0.85
     warm_path_max_hops: int = 3
     warm_path_max_results: int = 20
     warm_path_recency_halflife_days: float = 90.0

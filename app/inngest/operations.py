@@ -5,7 +5,11 @@ from typing import Any
 from app.core.config import settings
 from app.ingestion.canonical_store import create_canonical_event_store
 from app.ingestion.enrichment import clean_and_enrich_events
-from app.ingestion.entity_resolution import extract_entity_candidates, merge_entity_candidates
+from app.ingestion.entity_resolution import (
+    MergeResult,
+    extract_entity_candidates,
+    resolve_entities_multi_signal,
+)
 from app.ingestion.entity_store import create_entity_store
 from app.ingestion.graph_projection import create_graph_projection_service
 from app.ingestion.graph_store import create_graph_store
@@ -242,7 +246,19 @@ def _persist_relationships(
 def _process_enrichment(enrichment_payload: dict[str, Any]) -> dict[str, Any]:
     """Run pure-Python enrichment transforms in one pass."""
     entity_exact = extract_entity_candidates(enrichment_payload)
-    entity_merged = merge_entity_candidates(entity_exact.model_dump(mode="json"))
+
+    # Multi-signal resolution: Union-Find based matching across email, phone,
+    # LinkedIn URL, name+company, name+domain signals.
+    entity_resolved = resolve_entities_multi_signal(
+        entity_exact.candidates,
+        auto_merge_threshold=settings.entity_merge_auto_threshold,
+    )
+
+    # Backward-compat: downstream stages expect MergeResult shape
+    entity_merged = MergeResult(
+        resolved_count=entity_resolved.resolved_count,
+        resolved_entities=[g.canonical for g in entity_resolved.groups],
+    )
 
     metadata = extract_metadata_candidates(enrichment_payload)
     semantic = build_semantic_documents(enrichment_payload)
@@ -258,6 +274,8 @@ def _process_enrichment(enrichment_payload: dict[str, Any]) -> dict[str, Any]:
         "strength_result": relationships.model_dump(mode="json"),
         "entity_candidate_count": entity_exact.candidate_count,
         "resolved_count":         entity_merged.resolved_count,
+        "merge_candidate_count":  entity_resolved.merge_candidate_count,
+        "merge_candidates":       entity_resolved.merge_candidates,
         "metadata_count":         metadata.candidate_count,
         "document_count":         semantic.document_count,
         "interaction_count":      interactions.interaction_count,

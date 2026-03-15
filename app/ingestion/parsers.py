@@ -119,6 +119,7 @@ def _parse_contact(raw_event: RawCapturedEvent) -> ParsedCanonicalEvent:
         "phones": sorted(set(phone_values)),
         "company": company,
         "title": title,
+        "linkedin_url": payload.get("linkedin_url"),
     }
 
     return ParsedCanonicalEvent(
