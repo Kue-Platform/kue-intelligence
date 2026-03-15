@@ -69,30 +69,20 @@ create index if not exists idx_entity_merge_log_tenant
 create index if not exists idx_entity_merge_log_surviving
   on public.entity_merge_log(surviving_entity_id, merged_at desc);
 
--- ── 4. Unique constraint on interaction_facts for email-based upsert ────────
+-- ── 4. Add email columns to interaction_facts for email-based upsert ────────
 -- The pipeline persists interactions by actor_email/target_email before entity
--- resolution links them to entity IDs. This constraint enables idempotent
+-- resolution links them to entity IDs. These columns enable idempotent
 -- upsert via PostgREST on_conflict.
--- Only add if actor_email/target_email columns exist (added by relationship store).
-do $$
-begin
-  if exists (
-    select 1 from information_schema.columns
-    where table_schema = 'public'
-      and table_name = 'interaction_facts'
-      and column_name = 'actor_email'
-  ) then
-    -- Add columns if not present
-    begin
-      alter table public.interaction_facts
-        add column if not exists actor_email text,
-        add column if not exists target_email text;
-    exception when others then null;
-    end;
+alter table public.interaction_facts
+  add column if not exists actor_email text,
+  add column if not exists target_email text;
 
-    -- Create unique index for email-based upsert
-    create unique index if not exists idx_interaction_facts_email_dedup
-      on public.interaction_facts(tenant_id, source, actor_email, target_email, touchpoint_type, occurred_at)
-      where actor_email is not null and target_email is not null;
-  end if;
-end $$;
+-- Non-partial unique index required for PostgREST on_conflict resolution.
+-- Partial indexes (WHERE ... IS NOT NULL) are invisible to PostgREST's
+-- conflict detection and cause 42P10 errors on upsert.
+drop index if exists idx_interaction_facts_email_dedup;
+
+create unique index if not exists idx_interaction_facts_email_dedup
+  on public.interaction_facts(tenant_id, source, actor_email, target_email, touchpoint_type, occurred_at);
+
+notify pgrst, 'reload schema';

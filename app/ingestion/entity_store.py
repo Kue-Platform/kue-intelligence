@@ -18,11 +18,21 @@ from app.ingestion.metadata_extraction import MetadataCandidate
 
 
 @dataclass
+class CrossSourceMatch:
+    source_entity_event_id: str
+    existing_entity_id: str
+    signal_type: str
+    confidence: float
+    evidence: dict[str, Any]
+
+
+@dataclass
 class EntityPersistResult:
     resolved_count: int
     created_entities: int
     updated_entities: int
     identities_upserted: int
+    cross_source_matches: list[CrossSourceMatch] | None = None
 
 
 @dataclass
@@ -544,6 +554,62 @@ class SupabaseEntityStore(EntityStore):
             result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
         return result
 
+    def _bulk_fetch_entities_by_linkedin_url(
+        self, tenant_id: str, urls: list[str],
+    ) -> dict[str, str]:
+        """Return {linkedin_url -> entity_id}. Uses idx_entities_tenant_linkedin_url."""
+        if not urls:
+            return {}
+        unique_urls = list(set(urls))
+        result: dict[str, str] = {}
+        for i in range(0, len(unique_urls), 50):
+            chunk = unique_urls[i:i + 50]
+            response = httpx.get(
+                self._url("entities"),
+                headers=self._base_headers,
+                params={
+                    "tenant_id": f"eq.{tenant_id}",
+                    "linkedin_url": 'in.("' + '","'.join(chunk) + '")',
+                    "select": "linkedin_url,entity_id",
+                },
+                timeout=30.0,
+            )
+            if response.status_code >= 400:
+                continue  # non-critical, skip gracefully
+            result.update(
+                {row["linkedin_url"]: str(row["entity_id"]) for row in response.json() if row.get("linkedin_url")}
+            )
+        return result
+
+    def _bulk_fetch_entities_by_name_company(
+        self, tenant_id: str, company_norms: list[str],
+    ) -> dict[tuple[str, str], str]:
+        """Return {(name_norm, company_norm) -> entity_id}. Uses idx_entities_tenant_name_company."""
+        if not company_norms:
+            return {}
+        unique_companies = list(set(company_norms))
+        result: dict[tuple[str, str], str] = {}
+        for i in range(0, len(unique_companies), 50):
+            chunk = unique_companies[i:i + 50]
+            response = httpx.get(
+                self._url("entities"),
+                headers=self._base_headers,
+                params={
+                    "tenant_id": f"eq.{tenant_id}",
+                    "company_norm": 'in.("' + '","'.join(chunk) + '")',
+                    "select": "entity_id,display_name,company_norm",
+                },
+                timeout=30.0,
+            )
+            if response.status_code >= 400:
+                continue  # non-critical
+            for row in response.json():
+                name = " ".join((row.get("display_name") or "").strip().lower().split())
+                company = row.get("company_norm")
+                if name and company:
+                    result.setdefault((name, company), str(row["entity_id"]))
+        return result
+
     def upsert_entities(self, resolved_entities: list[EntityCandidate]) -> EntityPersistResult:
         if not resolved_entities:
             return EntityPersistResult(0, 0, 0, 0)
@@ -554,6 +620,7 @@ class SupabaseEntityStore(EntityStore):
             by_tenant[c.tenant_id].append(c)
 
         total_created = total_updated = total_identities = 0
+        all_cross_source_matches: list[CrossSourceMatch] = []
 
         for tenant_id, candidates in by_tenant.items():
             # We still need entity_id values to write entity_identities rows.
@@ -665,7 +732,67 @@ class SupabaseEntityStore(EntityStore):
                     )
                 total_identities += len(identity_rows)
 
-        return EntityPersistResult(len(resolved_entities), total_created, total_updated, total_identities)
+            # ── Post-insert cross-source detection ─────────────────────────
+            # For just-created entities, check if they match pre-existing ones
+            # by linkedin_url or name+company. Two cheap indexed queries.
+            just_created = [c for c in new_candidates if c.source_event_id in entity_id_map]
+            if just_created:
+                # 1. LinkedIn URL detection
+                li_urls = [c.linkedin_url for c in just_created if c.linkedin_url]
+                if li_urls:
+                    known_li = self._bulk_fetch_entities_by_linkedin_url(tenant_id, li_urls)
+                    just_created_eids = {entity_id_map[c.source_event_id] for c in just_created}
+                    for c in just_created:
+                        if not c.linkedin_url or c.linkedin_url not in known_li:
+                            continue
+                        existing_eid = known_li[c.linkedin_url]
+                        new_eid = entity_id_map[c.source_event_id]
+                        if existing_eid != new_eid and existing_eid not in just_created_eids:
+                            all_cross_source_matches.append(CrossSourceMatch(
+                                source_entity_event_id=c.source_event_id,
+                                existing_entity_id=existing_eid,
+                                signal_type="linkedin_url",
+                                confidence=0.99,
+                                evidence={"linkedin_url": c.linkedin_url, "new_entity_id": new_eid},
+                            ))
+
+                # 2. Name + company detection
+                companies = [c.company_norm for c in just_created if c.name_norm and c.company_norm]
+                if companies:
+                    known_nc = self._bulk_fetch_entities_by_name_company(tenant_id, companies)
+                    just_created_eids = {entity_id_map[c.source_event_id] for c in just_created}
+                    for c in just_created:
+                        if not c.name_norm or not c.company_norm:
+                            continue
+                        key = (c.name_norm, c.company_norm)
+                        if key not in known_nc:
+                            continue
+                        existing_eid = known_nc[key]
+                        new_eid = entity_id_map[c.source_event_id]
+                        if existing_eid != new_eid and existing_eid not in just_created_eids:
+                            # Avoid duplicate if already matched by linkedin_url
+                            already = any(
+                                m.existing_entity_id == existing_eid
+                                and m.evidence.get("new_entity_id") == new_eid
+                                for m in all_cross_source_matches
+                            )
+                            if not already:
+                                all_cross_source_matches.append(CrossSourceMatch(
+                                    source_entity_event_id=c.source_event_id,
+                                    existing_entity_id=existing_eid,
+                                    signal_type="name_company",
+                                    confidence=0.90,
+                                    evidence={
+                                        "name_norm": c.name_norm,
+                                        "company_norm": c.company_norm,
+                                        "new_entity_id": new_eid,
+                                    },
+                                ))
+
+        return EntityPersistResult(
+            len(resolved_entities), total_created, total_updated, total_identities,
+            cross_source_matches=all_cross_source_matches or None,
+        )
 
     def upsert_metadata(self, metadata_candidates: list[MetadataCandidate]) -> int:
         if not metadata_candidates:

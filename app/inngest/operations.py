@@ -203,6 +203,7 @@ def _persist_canonical(run_id: str, parsed_payload: dict[str, Any], parser_versi
 
 def _persist_entities(merged_payload: dict[str, Any]) -> dict[str, Any]:
     from app.ingestion.entity_resolution import EntityCandidate
+    from app.ingestion.merge_candidate_store import create_merge_candidate_store
 
     resolved_entities = [
         EntityCandidate.model_validate(item)
@@ -210,11 +211,67 @@ def _persist_entities(merged_payload: dict[str, Any]) -> dict[str, Any]:
     ]
     store = create_entity_store(settings)
     persist_result = store.upsert_entities(resolved_entities)
+
+    # Persist cross-source matches to merge_candidates + entity_merge_log.
+    # Both entity_ids (new + existing) now exist in the DB, so FK constraints
+    # on merge_candidates are satisfied.
+    cross_source_count = 0
+    merge_log_count = 0
+    if persist_result.cross_source_matches:
+        merge_store = create_merge_candidate_store(settings)
+        tenant_id = resolved_entities[0].tenant_id if resolved_entities else ""
+        auto_threshold = settings.entity_merge_auto_threshold
+
+        candidates_to_insert: list[dict[str, Any]] = []
+        for match in persist_result.cross_source_matches:
+            new_entity_id = match.evidence.get("new_entity_id", "")
+            if not new_entity_id:
+                continue
+
+            if match.confidence >= auto_threshold:
+                # High confidence: log to entity_merge_log then execute merge
+                merge_store.log_merge(
+                    tenant_id=tenant_id,
+                    surviving_entity_id=match.existing_entity_id,
+                    merged_entity_id=new_entity_id,
+                    match_signal=match.signal_type,
+                    confidence=match.confidence,
+                    rollback_payload={
+                        "source_event_id": match.source_entity_event_id,
+                        **match.evidence,
+                    },
+                )
+                store.execute_merge(
+                    tenant_id=tenant_id,
+                    surviving_entity_id=match.existing_entity_id,
+                    merged_entity_id=new_entity_id,
+                )
+                merge_log_count += 1
+            else:
+                # Below threshold: insert merge_candidate for manual review
+                candidates_to_insert.append({
+                    "tenant_id": tenant_id,
+                    "source_entity_id": match.existing_entity_id,
+                    "target_entity_id": new_entity_id,
+                    "match_signals": {
+                        match.signal_type: {
+                            "confidence": match.confidence,
+                            "evidence": match.evidence,
+                        },
+                    },
+                    "confidence": match.confidence,
+                })
+
+        if candidates_to_insert:
+            cross_source_count = merge_store.insert_candidates(candidates_to_insert)
+
     return {
         "resolved_count": persist_result.resolved_count,
         "created_entities": persist_result.created_entities,
         "updated_entities": persist_result.updated_entities,
         "identities_upserted": persist_result.identities_upserted,
+        "cross_source_matches": cross_source_count,
+        "merge_log_entries": merge_log_count,
         "store": store.store_name,
     }
 
