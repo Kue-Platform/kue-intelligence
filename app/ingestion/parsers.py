@@ -248,6 +248,45 @@ def _parse_calendar(raw_event: RawCapturedEvent) -> ParsedCanonicalEvent:
     )
 
 
+def _parse_linkedin_message(raw_event: RawCapturedEvent) -> ParsedCanonicalEvent:
+    payload = raw_event.payload
+    warnings: list[str] = []
+
+    subject = payload.get("subject")
+    from_value = payload.get("from")
+    to_raw = payload.get("to")
+    to_values: list[str] = []
+    if isinstance(to_raw, list):
+        to_values = [v for v in to_raw if isinstance(v, str) and v.strip()]
+    elif isinstance(to_raw, str) and to_raw.strip():
+        to_values = [to_raw.strip()]
+
+    if not subject:
+        warnings.append("missing_subject")
+
+    normalized = {
+        "thread_id": payload.get("threadId"),
+        "subject": subject,
+        "from": from_value if isinstance(from_value, str) else None,
+        "to": sorted(set(to_values)),
+        "snippet": payload.get("snippet"),
+        "occurred_at": _to_iso_utc(raw_event.occurred_at),
+    }
+
+    return ParsedCanonicalEvent(
+        raw_event_id=raw_event.raw_event_id,
+        tenant_id=raw_event.tenant_id,
+        user_id=raw_event.user_id,
+        trace_id=raw_event.trace_id,
+        source=raw_event.source,
+        source_event_id=raw_event.source_event_id,
+        occurred_at=raw_event.occurred_at,
+        event_type=CanonicalEventType.EMAIL_MESSAGE,
+        normalized=normalized,
+        parse_warnings=warnings,
+    )
+
+
 def parse_raw_events(raw_events: list[RawCapturedEvent]) -> ParseResult:
     parsed: list[ParsedCanonicalEvent] = []
     failures: list[ParseFailure] = []
@@ -257,7 +296,11 @@ def parse_raw_events(raw_events: list[RawCapturedEvent]) -> ParseResult:
             if event.source == IngestionSource.GOOGLE_CONTACTS:
                 parsed.append(_parse_contact(event))
             elif event.source == IngestionSource.LINKEDIN:
-                parsed.append(_parse_contact(event))
+                event_kind = event.payload.get("_event_kind", "contact")
+                if event_kind == "message":
+                    parsed.append(_parse_linkedin_message(event))
+                else:
+                    parsed.append(_parse_contact(event))
             elif event.source == IngestionSource.CSV_IMPORT:
                 parsed.append(_parse_contact(event))
             elif event.source == IngestionSource.GMAIL:

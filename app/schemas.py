@@ -296,6 +296,24 @@ class CsvImportResponse(BaseModel):
     status: str = "accepted"
 
 
+class LinkedInZipFileStats(BaseModel):
+    file_name: str
+    rows_total: int
+    rows_accepted: int
+    rows_skipped: int
+
+
+class LinkedInZipImportResponse(BaseModel):
+    run_id: str
+    event_name: str
+    event_id: str | None = None
+    trace_id: str
+    total_events: int
+    file_stats: list[LinkedInZipFileStats]
+    warnings: list[str] = []
+    status: str = "accepted"
+
+
 # ---------------------------------------------------------------------------
 # Warm Path
 # ---------------------------------------------------------------------------

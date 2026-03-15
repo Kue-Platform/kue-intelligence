@@ -1,4 +1,5 @@
 from functools import lru_cache
+import io
 import json
 import inspect
 from typing import Awaitable, Callable
@@ -14,6 +15,7 @@ from app.ingestion.csv_import import (
     normalize_csv_rows_to_source_events,
     normalize_csv_text_to_source_events,
 )
+from app.ingestion.linkedin_zip_import import extract_linkedin_zip_to_source_events
 from app.ingestion.google_connector import (
     GoogleConnectorError,
     resolve_google_state,
@@ -78,6 +80,8 @@ from app.schemas import (
     CsvImportMockRequest,
     CsvImportResponse,
     CsvImportSourceHint,
+    LinkedInZipImportResponse,
+    LinkedInZipFileStats,
 )
 
 router = APIRouter(prefix="/v1/ingestion", tags=["ingestion"])
@@ -440,6 +444,132 @@ async def import_csv(
         template_detected=normalized.template_detected,
         mapping_mode=normalized.mapping_mode,
         warning_samples=normalized.warning_samples[:10],
+    )
+
+
+@router.post("/import/linkedin-zip", response_model=LinkedInZipImportResponse)
+async def import_linkedin_zip(
+    request: Request,
+    dispatch_event: InngestDispatcher = Depends(get_inngest_dispatcher),
+    raw_store: RawEventStore = Depends(get_raw_event_store),
+    pipeline_store: PipelineStore = Depends(get_pipeline_store),
+    source_connection_store: SourceConnectionStore = Depends(get_source_connection_store),
+) -> LinkedInZipImportResponse:
+    import zipfile
+
+    form = await request.form()
+    file_obj = form.get("file")
+    if file_obj is None:
+        raise HTTPException(status_code=400, detail="Missing file in multipart form.")
+
+    tenant_id = str(form.get("tenant_id") or "").strip()
+    user_id = str(form.get("user_id") or "").strip()
+    trace_id_raw = str(form.get("trace_id") or "").strip() or None
+
+    if not tenant_id or not user_id:
+        raise HTTPException(status_code=400, detail="tenant_id and user_id are required.")
+
+    file_bytes = await file_obj.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    if not zipfile.is_zipfile(io.BytesIO(file_bytes)):
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid ZIP archive.")
+
+    resolved_trace_id = trace_id_raw or f"trace_{uuid4().hex}"
+
+    result = extract_linkedin_zip_to_source_events(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        trace_id=resolved_trace_id,
+        zip_bytes=file_bytes,
+    )
+    if result.total_events == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "LinkedIn ZIP import failed: no valid events found.",
+                "warnings": result.warnings,
+            },
+        )
+
+    pipeline_store.ensure_tenant_user(tenant_id, user_id)
+    run_id = pipeline_store.create_pipeline_run(
+        trace_id=resolved_trace_id,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        source=IngestionSource.LINKEDIN,
+        trigger_type="pipeline/run.requested",
+        source_event_id=result.source_events[0].source_event_id,
+        metadata={
+            "event_name": "pipeline/run.requested",
+            "ingest_path": "import/linkedin-zip",
+            "import_file_name": getattr(file_obj, "filename", None) or "linkedin_export.zip",
+            "total_events": result.total_events,
+            "file_stats": [
+                {
+                    "file_name": fr.file_name,
+                    "rows_total": fr.rows_total,
+                    "rows_accepted": fr.rows_accepted,
+                    "rows_skipped": fr.rows_skipped,
+                }
+                for fr in result.file_results
+            ],
+        },
+    )
+    raw_store.persist_source_events(result.source_events, run_id=run_id, ingest_version="v1")
+    source_connection_store.upsert_connections(
+        [
+            SourceConnectionRecord(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                source=IngestionSource.LINKEDIN,
+                external_account_id=f"linkedin_zip:{user_id}",
+                scopes=[],
+                token_json={
+                    "import_type": "linkedin_zip",
+                    "file_name": getattr(file_obj, "filename", None) or "linkedin_export.zip",
+                    "total_events": result.total_events,
+                },
+                status="active",
+                last_sync_at=result.source_events[0].occurred_at,
+                last_error=None,
+            )
+        ]
+    )
+
+    try:
+        event_id = await dispatch_event(
+            "pipeline/run.requested",
+            {
+                "trace_id": resolved_trace_id,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "run_id": run_id,
+                "source": str(IngestionSource.LINKEDIN),
+                "source_count": result.total_events,
+                "pre_stored": True,
+                "parser_version": settings.parser_version,
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Inngest dispatch failed: {exc}") from exc
+
+    return LinkedInZipImportResponse(
+        run_id=run_id,
+        event_name="pipeline/run.requested",
+        event_id=event_id,
+        trace_id=resolved_trace_id,
+        total_events=result.total_events,
+        file_stats=[
+            LinkedInZipFileStats(
+                file_name=fr.file_name,
+                rows_total=fr.rows_total,
+                rows_accepted=fr.rows_accepted,
+                rows_skipped=fr.rows_skipped,
+            )
+            for fr in result.file_results
+        ],
+        warnings=result.warnings[:20],
     )
 
 
