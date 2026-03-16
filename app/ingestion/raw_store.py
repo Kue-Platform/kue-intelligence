@@ -85,13 +85,20 @@ class SqliteRawEventStore(RawEventStore):
                 """
             )
             conn.execute("PRAGMA table_info(raw_events)")
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(raw_events)").fetchall()}
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(raw_events)").fetchall()
+            }
             if "run_id" not in columns:
                 conn.execute("ALTER TABLE raw_events ADD COLUMN run_id TEXT")
             if "headers_json" not in columns:
-                conn.execute("ALTER TABLE raw_events ADD COLUMN headers_json TEXT NOT NULL DEFAULT '{}'")
+                conn.execute(
+                    "ALTER TABLE raw_events ADD COLUMN headers_json TEXT NOT NULL DEFAULT '{}'"
+                )
             if "ingest_version" not in columns:
-                conn.execute("ALTER TABLE raw_events ADD COLUMN ingest_version TEXT NOT NULL DEFAULT 'v1'")
+                conn.execute(
+                    "ALTER TABLE raw_events ADD COLUMN ingest_version TEXT NOT NULL DEFAULT 'v1'"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_raw_events_trace_id ON raw_events(trace_id)"
             )

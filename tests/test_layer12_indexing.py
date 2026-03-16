@@ -51,7 +51,9 @@ def test_layer12_index_endpoint_applies_hybrid_signals() -> None:
                     "resourceName": "people/c_l12",
                     "names": [{"displayName": "Rachel Lee"}],
                     "emailAddresses": [{"value": "rachel@stripe.com"}],
-                    "organizations": [{"name": "Stripe", "title": "Engineering Manager"}],
+                    "organizations": [
+                        {"name": "Stripe", "title": "Engineering Manager"}
+                    ],
                 },
             )
         ]

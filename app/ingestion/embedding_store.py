@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +26,9 @@ class EmbeddingStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def persist_vectors(self, records: list[EmbeddingVectorRecord]) -> EmbeddingPersistResult:
+    def persist_vectors(
+        self, records: list[EmbeddingVectorRecord]
+    ) -> EmbeddingPersistResult:
         raise NotImplementedError
 
 
@@ -68,12 +69,21 @@ class SqliteEmbeddingStore(EmbeddingStore):
                 """
             )
             # Ensure the column exists for vector persistence.
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(search_documents)").fetchall()}
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(search_documents)"
+                ).fetchall()
+            }
             if "embedding_json" not in columns:
-                conn.execute("ALTER TABLE search_documents ADD COLUMN embedding_json TEXT")
+                conn.execute(
+                    "ALTER TABLE search_documents ADD COLUMN embedding_json TEXT"
+                )
             conn.commit()
 
-    def persist_vectors(self, records: list[EmbeddingVectorRecord]) -> EmbeddingPersistResult:
+    def persist_vectors(
+        self, records: list[EmbeddingVectorRecord]
+    ) -> EmbeddingPersistResult:
         if not records:
             return EmbeddingPersistResult(0, 0)
         persisted = 0
@@ -134,14 +144,16 @@ class SupabaseEmbeddingStore(EmbeddingStore):
     def _url(self, table: str) -> str:
         return f"{self._supabase_url}/rest/v1/{table}"
 
-    def _bulk_resolve_entity_ids(self, tenant_id: str, emails: list[str]) -> dict[str, str]:
+    def _bulk_resolve_entity_ids(
+        self, tenant_id: str, emails: list[str]
+    ) -> dict[str, str]:
         """Return {primary_email -> entity_id} for all given emails in one GET."""
         if not emails:
             return {}
         unique_emails = list(set(emails))
         result: dict[str, str] = {}
         for i in range(0, len(unique_emails), 50):
-            chunk = unique_emails[i:i + 50]
+            chunk = unique_emails[i : i + 50]
             response = httpx.get(
                 self._url("entities"),
                 headers=self._base_headers,
@@ -156,14 +168,19 @@ class SupabaseEmbeddingStore(EmbeddingStore):
                 raise RuntimeError(
                     f"Supabase entity bulk lookup for embeddings failed ({response.status_code}): {response.text}"
                 )
-            result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
+            result.update(
+                {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
+            )
         return result
 
-    def persist_vectors(self, records: list[EmbeddingVectorRecord]) -> EmbeddingPersistResult:
+    def persist_vectors(
+        self, records: list[EmbeddingVectorRecord]
+    ) -> EmbeddingPersistResult:
         if not records:
             return EmbeddingPersistResult(0, 0)
 
         from collections import defaultdict
+
         by_tenant: dict[str, list[EmbeddingVectorRecord]] = defaultdict(list)
         for item in records:
             by_tenant[item.tenant_id].append(item)
@@ -192,7 +209,9 @@ class SupabaseEmbeddingStore(EmbeddingStore):
                     continue
                 key = (item.tenant_id, entity_id, item.doc_type, item.content)
                 # pgvector expects a literal string like '[0.1,0.2,...]'
-                vector_literal = "[" + ",".join(f"{v:.6f}" for v in item.embedding) + "]"
+                vector_literal = (
+                    "[" + ",".join(f"{v:.6f}" for v in item.embedding) + "]"
+                )
                 deduped[key] = {
                     "tenant_id": item.tenant_id,
                     "entity_id": entity_id,
@@ -206,7 +225,10 @@ class SupabaseEmbeddingStore(EmbeddingStore):
             if update_rows:
                 bulk_resp = httpx.post(
                     self._url("search_documents"),
-                    headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                    headers={
+                        **self._base_headers,
+                        "Prefer": "resolution=merge-duplicates,return=minimal",
+                    },
                     params={"on_conflict": "tenant_id,entity_id,doc_type,content"},
                     json=update_rows,
                     timeout=30.0,
@@ -216,7 +238,6 @@ class SupabaseEmbeddingStore(EmbeddingStore):
                         f"Supabase embedding bulk persist failed ({bulk_resp.status_code}): {bulk_resp.text}"
                     )
                 persisted += len(update_rows)
-
 
         return EmbeddingPersistResult(persisted, skipped)
 

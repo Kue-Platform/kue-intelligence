@@ -7,7 +7,10 @@ from fastapi import APIRouter, Depends, HTTPException, Header
 import inngest
 
 from app.core.config import settings
-from app.ingestion.canonical_store import CanonicalEventStore, create_canonical_event_store
+from app.ingestion.canonical_store import (
+    CanonicalEventStore,
+    create_canonical_event_store,
+)
 from app.ingestion.connectors import trigger_mock_connector
 from app.ingestion.google_connector import (
     GoogleConnectorError,
@@ -19,14 +22,26 @@ from app.ingestion.raw_store import create_raw_event_store
 from app.inngest.runtime import inngest_client
 from app.ingestion.parsers import parse_raw_events
 from app.ingestion.enrichment import clean_and_enrich_events
-from app.ingestion.entity_resolution import extract_entity_candidates, merge_entity_candidates
+from app.ingestion.entity_resolution import (
+    extract_entity_candidates,
+    merge_entity_candidates,
+)
 from app.ingestion.entity_store import EntityStore, create_entity_store
 from app.ingestion.metadata_extraction import extract_metadata_candidates
 from app.ingestion.admin_reset import reset_all_data
-from app.ingestion.relationship_extraction import compute_relationship_strength, extract_interactions
-from app.ingestion.relationship_store import RelationshipStore, create_relationship_store
+from app.ingestion.relationship_extraction import (
+    compute_relationship_strength,
+    extract_interactions,
+)
+from app.ingestion.relationship_store import (
+    RelationshipStore,
+    create_relationship_store,
+)
 from app.ingestion.semantic_prep import build_semantic_documents
-from app.ingestion.search_document_store import SearchDocumentStore, create_search_document_store
+from app.ingestion.search_document_store import (
+    SearchDocumentStore,
+    create_search_document_store,
+)
 from app.ingestion.embeddings import (
     build_embedding_requests,
     embedding_cache_lookup,
@@ -158,7 +173,9 @@ def get_source_connection_store() -> SourceConnectionStore:
 
 def _assert_admin_reset_token(token: str | None) -> None:
     if not settings.admin_reset_token:
-        raise HTTPException(status_code=503, detail="ADMIN_RESET_TOKEN is not configured.")
+        raise HTTPException(
+            status_code=503, detail="ADMIN_RESET_TOKEN is not configured."
+        )
     if token != settings.admin_reset_token:
         raise HTTPException(status_code=401, detail="Invalid admin reset token.")
 
@@ -198,7 +215,9 @@ def get_inngest_dispatcher() -> InngestDispatcher:
 
 
 @router.post("/mock", response_model=IngestionMockTriggerResponse)
-def trigger_ingestion_mock(payload: IngestionMockTriggerRequest) -> IngestionMockTriggerResponse:
+def trigger_ingestion_mock(
+    payload: IngestionMockTriggerRequest,
+) -> IngestionMockTriggerResponse:
     try:
         result = trigger_mock_connector(
             source=payload.source,
@@ -229,7 +248,9 @@ async def google_oauth_callback(
     dispatch_event: InngestDispatcher = Depends(get_inngest_dispatcher),
 ) -> GoogleOAuthCallbackResponse:
     if error:
-        raise HTTPException(status_code=400, detail=f"Google OAuth returned an error: {error}")
+        raise HTTPException(
+            status_code=400, detail=f"Google OAuth returned an error: {error}"
+        )
     if not code:
         raise HTTPException(status_code=400, detail="Missing OAuth authorization code.")
 
@@ -255,7 +276,9 @@ async def google_oauth_callback(
             },
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Inngest dispatch failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Inngest dispatch failed: {exc}"
+        ) from exc
 
     return GoogleOAuthCallbackResponse(
         tenant_id=resolved_tenant_id,
@@ -274,7 +297,9 @@ async def google_oauth_callback_mock(
     dispatch_event: InngestDispatcher = Depends(get_inngest_dispatcher),
     raw_store: RawEventStore = Depends(get_raw_event_store),
     pipeline_store: PipelineStore = Depends(get_pipeline_store),
-    source_connection_store: SourceConnectionStore = Depends(get_source_connection_store),
+    source_connection_store: SourceConnectionStore = Depends(
+        get_source_connection_store
+    ),
 ) -> GoogleOAuthCallbackResponse:
     """Store-first mock ingestion.
 
@@ -309,7 +334,9 @@ async def google_oauth_callback_mock(
             payload=dict(request.payload),
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Mock connector failed: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Mock connector failed: {exc}"
+        ) from exc
 
     pipeline_store.ensure_tenant_user(resolved_tenant_id, resolved_user_id)
     run_id = pipeline_store.create_pipeline_run(
@@ -318,7 +345,9 @@ async def google_oauth_callback_mock(
         user_id=resolved_user_id,
         source=source_events[0].source if source_events else request.source_type,
         trigger_type="kue/user.mock_connected",
-        source_event_id=str(source_events[0].source_event_id) if source_events else None,
+        source_event_id=str(source_events[0].source_event_id)
+        if source_events
+        else None,
         metadata={"event_name": "kue/user.mock_connected", "ingest_path": "mock_oauth"},
     )
     source_map = {
@@ -341,9 +370,13 @@ async def google_oauth_callback_mock(
     )
 
     try:
-        raw_store.persist_source_events(source_events, run_id=run_id, ingest_version="v1")
+        raw_store.persist_source_events(
+            source_events, run_id=run_id, ingest_version="v1"
+        )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Raw store persist failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Raw store persist failed: {exc}"
+        ) from exc
 
     try:
         event_id = await dispatch_event(
@@ -359,7 +392,9 @@ async def google_oauth_callback_mock(
             },
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Inngest dispatch failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Inngest dispatch failed: {exc}"
+        ) from exc
 
     return GoogleOAuthCallbackResponse(
         tenant_id=resolved_tenant_id,
@@ -399,7 +434,9 @@ async def run_layer2_capture(
     """
     trace_id = request.source_events[0].trace_id if request.source_events else None
     if trace_id is None:
-        raise HTTPException(status_code=400, detail="source_events must include trace_id")
+        raise HTTPException(
+            status_code=400, detail="source_events must include trace_id"
+        )
 
     tenant_id = request.source_events[0].tenant_id
     user_id = request.source_events[0].user_id
@@ -413,7 +450,10 @@ async def run_layer2_capture(
         source=request.source_events[0].source,
         trigger_type="pipeline/run.requested",
         source_event_id=str(request.source_events[0].source_event_id),
-        metadata={"event_name": "pipeline/run.requested", "ingest_path": "layer2/capture"},
+        metadata={
+            "event_name": "pipeline/run.requested",
+            "ingest_path": "layer2/capture",
+        },
     )
 
     try:
@@ -423,7 +463,9 @@ async def run_layer2_capture(
             ingest_version="v1",
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Raw store persist failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Raw store persist failed: {exc}"
+        ) from exc
 
     try:
         event_id = await dispatch_event(
@@ -439,7 +481,9 @@ async def run_layer2_capture(
             },
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Inngest dispatch failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Inngest dispatch failed: {exc}"
+        ) from exc
 
     return PipelineRunResponse(
         run_id=run_id,
@@ -449,7 +493,9 @@ async def run_layer2_capture(
     )
 
 
-@router.post("/stage/canonicalization/replay/{trace_id}", response_model=PipelineRunResponse)
+@router.post(
+    "/stage/canonicalization/replay/{trace_id}", response_model=PipelineRunResponse
+)
 async def replay_stage_canonicalization(
     trace_id: str,
     raw_store: RawEventStore = Depends(get_raw_event_store),
@@ -457,7 +503,9 @@ async def replay_stage_canonicalization(
 ) -> PipelineRunResponse:
     events = raw_store.list_by_trace_id(trace_id)
     if not events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
     try:
         event_id = await dispatch_event(
             "pipeline/stage.canonicalization.replay.requested",
@@ -470,7 +518,9 @@ async def replay_stage_canonicalization(
             },
         )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Inngest dispatch failed: {exc}") from exc
+        raise HTTPException(
+            status_code=502, detail=f"Inngest dispatch failed: {exc}"
+        ) from exc
     return PipelineRunResponse(
         run_id=None,
         event_name="pipeline/stage.canonicalization.replay.requested",
@@ -487,7 +537,9 @@ def parse_layer3_by_trace(
 ) -> Layer3ParseResponse:
     raw_events = raw_store.list_by_trace_id(trace_id)
     if not raw_events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
 
     parse_result = parse_raw_events(raw_events)
     persist_result = canonical_store.persist_parsed_events(
@@ -556,7 +608,9 @@ def validate_layer4_by_trace(
 ) -> Layer4ValidationResponse:
     raw_events = raw_store.list_by_trace_id(trace_id)
     if not raw_events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
 
     parse_result = parse_raw_events(raw_events)
     validation_result = validate_parsed_events(
@@ -602,7 +656,9 @@ def enrich_layer5_by_trace(
 ) -> Layer5EnrichmentResponse:
     raw_events = raw_store.list_by_trace_id(trace_id)
     if not raw_events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
 
     parse_result = parse_raw_events(raw_events)
     validation_result = validate_parsed_events(
@@ -624,7 +680,9 @@ def enrich_layer5_by_trace(
             ]
         }
     )
-    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    enrichment_result = clean_and_enrich_events(
+        validation_result.model_dump(mode="json")
+    )
 
     sample: list[CanonicalEvent] = []
     for item in enrichment_result.parsed_events[:5]:
@@ -652,7 +710,9 @@ def enrich_layer5_by_trace(
     )
 
 
-@router.post("/layer6/resolve/{trace_id}", response_model=Layer6EntityResolutionResponse)
+@router.post(
+    "/layer6/resolve/{trace_id}", response_model=Layer6EntityResolutionResponse
+)
 def resolve_layer6_by_trace(
     trace_id: str,
     raw_store: RawEventStore = Depends(get_raw_event_store),
@@ -660,7 +720,9 @@ def resolve_layer6_by_trace(
 ) -> Layer6EntityResolutionResponse:
     raw_events = raw_store.list_by_trace_id(trace_id)
     if not raw_events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
 
     parse_result = parse_raw_events(raw_events)
     validation_result = validate_parsed_events(
@@ -682,7 +744,9 @@ def resolve_layer6_by_trace(
             ]
         }
     )
-    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    enrichment_result = clean_and_enrich_events(
+        validation_result.model_dump(mode="json")
+    )
     exact_match = extract_entity_candidates(enrichment_result.model_dump(mode="json"))
     merge_result = merge_entity_candidates(exact_match.model_dump(mode="json"))
     persist_result = entity_store.upsert_entities(merge_result.resolved_entities)
@@ -698,7 +762,9 @@ def resolve_layer6_by_trace(
     )
 
 
-@router.post("/layer7/relationships/{trace_id}", response_model=Layer7RelationshipResponse)
+@router.post(
+    "/layer7/relationships/{trace_id}", response_model=Layer7RelationshipResponse
+)
 def relationship_layer7_by_trace(
     trace_id: str,
     raw_store: RawEventStore = Depends(get_raw_event_store),
@@ -706,7 +772,9 @@ def relationship_layer7_by_trace(
 ) -> Layer7RelationshipResponse:
     raw_events = raw_store.list_by_trace_id(trace_id)
     if not raw_events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
 
     parse_result = parse_raw_events(raw_events)
     validation_result = validate_parsed_events(
@@ -728,10 +796,14 @@ def relationship_layer7_by_trace(
             ]
         }
     )
-    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    enrichment_result = clean_and_enrich_events(
+        validation_result.model_dump(mode="json")
+    )
     interactions = extract_interactions(enrichment_result.model_dump(mode="json"))
     strengths = compute_relationship_strength(interactions.model_dump(mode="json"))
-    persist_result = relationship_store.persist(interactions.interactions, strengths.relationships)
+    persist_result = relationship_store.persist(
+        interactions.interactions, strengths.relationships
+    )
     return Layer7RelationshipResponse(
         trace_id=trace_id,
         interaction_count=persist_result.interaction_count,
@@ -749,7 +821,9 @@ def metadata_layer8_by_trace(
 ) -> Layer8MetadataResponse:
     raw_events = raw_store.list_by_trace_id(trace_id)
     if not raw_events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
 
     parse_result = parse_raw_events(raw_events)
     validation_result = validate_parsed_events(
@@ -771,8 +845,12 @@ def metadata_layer8_by_trace(
             ]
         }
     )
-    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
-    metadata_result = extract_metadata_candidates(enrichment_result.model_dump(mode="json"))
+    enrichment_result = clean_and_enrich_events(
+        validation_result.model_dump(mode="json")
+    )
+    metadata_result = extract_metadata_candidates(
+        enrichment_result.model_dump(mode="json")
+    )
     updated_count = entity_store.upsert_metadata(metadata_result.candidates)
     return Layer8MetadataResponse(
         trace_id=trace_id,
@@ -791,7 +869,9 @@ def semantic_layer9_by_trace(
 ) -> Layer9SemanticResponse:
     raw_events = raw_store.list_by_trace_id(trace_id)
     if not raw_events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
 
     parse_result = parse_raw_events(raw_events)
     validation_result = validate_parsed_events(
@@ -813,14 +893,18 @@ def semantic_layer9_by_trace(
             ]
         }
     )
-    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    enrichment_result = clean_and_enrich_events(
+        validation_result.model_dump(mode="json")
+    )
 
     # Ensure entities exist so semantic docs can bind entity_id.
     exact_match = extract_entity_candidates(enrichment_result.model_dump(mode="json"))
     merge_result = merge_entity_candidates(exact_match.model_dump(mode="json"))
     entity_store.upsert_entities(merge_result.resolved_entities)
 
-    semantic_result = build_semantic_documents(enrichment_result.model_dump(mode="json"))
+    semantic_result = build_semantic_documents(
+        enrichment_result.model_dump(mode="json")
+    )
     persist_result = search_store.persist_documents(semantic_result.documents)
     return Layer9SemanticResponse(
         trace_id=trace_id,
@@ -841,7 +925,9 @@ def embedding_layer10_by_trace(
 ) -> Layer10EmbeddingResponse:
     raw_events = raw_store.list_by_trace_id(trace_id)
     if not raw_events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
 
     parse_result = parse_raw_events(raw_events)
     validation_result = validate_parsed_events(
@@ -863,12 +949,16 @@ def embedding_layer10_by_trace(
             ]
         }
     )
-    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    enrichment_result = clean_and_enrich_events(
+        validation_result.model_dump(mode="json")
+    )
     exact_match = extract_entity_candidates(enrichment_result.model_dump(mode="json"))
     merge_result = merge_entity_candidates(exact_match.model_dump(mode="json"))
     entity_store.upsert_entities(merge_result.resolved_entities)
 
-    semantic_result = build_semantic_documents(enrichment_result.model_dump(mode="json"))
+    semantic_result = build_semantic_documents(
+        enrichment_result.model_dump(mode="json")
+    )
     search_store.persist_documents(semantic_result.documents)
 
     requests = build_embedding_requests(semantic_result.model_dump(mode="json"))
@@ -898,7 +988,9 @@ def cache_layer11_by_trace(
 ) -> Layer11CacheResponse:
     raw_events = raw_store.list_by_trace_id(trace_id)
     if not raw_events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
 
     parse_result = parse_raw_events(raw_events)
     validation_result = validate_parsed_events(
@@ -920,15 +1012,21 @@ def cache_layer11_by_trace(
             ]
         }
     )
-    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    enrichment_result = clean_and_enrich_events(
+        validation_result.model_dump(mode="json")
+    )
 
     enrichment_cached = 0
     for event in enrichment_result.parsed_events:
         key = f"{event.get('tenant_id')}:{event.get('source_event_id')}"
-        cache_registry.put(namespace="enrichment", version="v1", key=key, value=dict(event))
+        cache_registry.put(
+            namespace="enrichment", version="v1", key=key, value=dict(event)
+        )
         enrichment_cached += 1
 
-    semantic_result = build_semantic_documents(enrichment_result.model_dump(mode="json"))
+    semantic_result = build_semantic_documents(
+        enrichment_result.model_dump(mode="json")
+    )
     requests = build_embedding_requests(semantic_result.model_dump(mode="json"))
     lookup = embedding_cache_lookup(requests)
     generated = generate_embeddings(lookup.misses)
@@ -964,7 +1062,9 @@ def index_layer12_by_trace(
 ) -> Layer12IndexResponse:
     raw_events = raw_store.list_by_trace_id(trace_id)
     if not raw_events:
-        raise HTTPException(status_code=404, detail=f"No raw events found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No raw events found for trace_id={trace_id}"
+        )
 
     parse_result = parse_raw_events(raw_events)
     validation_result = validate_parsed_events(
@@ -986,12 +1086,16 @@ def index_layer12_by_trace(
             ]
         }
     )
-    enrichment_result = clean_and_enrich_events(validation_result.model_dump(mode="json"))
+    enrichment_result = clean_and_enrich_events(
+        validation_result.model_dump(mode="json")
+    )
     exact_match = extract_entity_candidates(enrichment_result.model_dump(mode="json"))
     merge_result = merge_entity_candidates(exact_match.model_dump(mode="json"))
     entity_store.upsert_entities(merge_result.resolved_entities)
 
-    semantic_result = build_semantic_documents(enrichment_result.model_dump(mode="json"))
+    semantic_result = build_semantic_documents(
+        enrichment_result.model_dump(mode="json")
+    )
     search_store.persist_documents(semantic_result.documents)
 
     requests = build_embedding_requests(semantic_result.model_dump(mode="json"))
@@ -1025,7 +1129,9 @@ def get_pipeline_run_by_trace(
 ) -> PipelineRunStatusResponse:
     run = pipeline_store.get_run_by_trace_id(trace_id)
     if run is None:
-        raise HTTPException(status_code=404, detail=f"No pipeline run found for trace_id={trace_id}")
+        raise HTTPException(
+            status_code=404, detail=f"No pipeline run found for trace_id={trace_id}"
+        )
     return PipelineRunStatusResponse(
         run_id=run.run_id,
         trace_id=run.trace_id,

@@ -40,12 +40,18 @@ def build_semantic_documents(enrichment_payload: dict[str, Any]) -> SemanticPrep
 
         if event_type == "contact":
             emails = normalized.get("emails", [])
-            primary_email = str(emails[0]).strip().lower() if isinstance(emails, list) and emails else None
+            primary_email = (
+                str(emails[0]).strip().lower()
+                if isinstance(emails, list) and emails
+                else None
+            )
             content_parts = [
                 _clean(normalized.get("full_name")),
                 _clean(normalized.get("title")),
                 _clean(normalized.get("company")),
-                " ".join([str(e).lower() for e in emails]) if isinstance(emails, list) else None,
+                " ".join([str(e).lower() for e in emails])
+                if isinstance(emails, list)
+                else None,
             ]
             content = " | ".join([p for p in content_parts if p]) or "contact"
             docs.append(
@@ -72,7 +78,9 @@ def build_semantic_documents(enrichment_payload: dict[str, Any]) -> SemanticPrep
             docs.append(
                 SemanticDocument(
                     tenant_id=tenant_id,
-                    primary_email=str(from_email).strip().lower() if from_email else None,
+                    primary_email=str(from_email).strip().lower()
+                    if from_email
+                    else None,
                     doc_type="email_summary",
                     content=content,
                     metadata_json={
@@ -95,7 +103,9 @@ def build_semantic_documents(enrichment_payload: dict[str, Any]) -> SemanticPrep
             )
             summary = _clean(normalized.get("summary"))
             location = _clean(normalized.get("location"))
-            content = " | ".join([p for p in [summary, location] if p]) or "calendar_event"
+            content = (
+                " | ".join([p for p in [summary, location] if p]) or "calendar_event"
+            )
             docs.append(
                 SemanticDocument(
                     tenant_id=tenant_id,

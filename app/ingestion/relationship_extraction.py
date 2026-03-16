@@ -53,7 +53,9 @@ def _norm_email(value: str | None) -> str | None:
     return v if v else None
 
 
-def extract_interactions(enrichment_payload: dict[str, Any]) -> InteractionExtractResult:
+def extract_interactions(
+    enrichment_payload: dict[str, Any],
+) -> InteractionExtractResult:
     parsed_events = list(enrichment_payload.get("parsed_events", []))
     interactions: list[InteractionCandidate] = []
 
@@ -106,10 +108,14 @@ def extract_interactions(enrichment_payload: dict[str, Any]) -> InteractionExtra
                             )
                         )
 
-    return InteractionExtractResult(interaction_count=len(interactions), interactions=interactions)
+    return InteractionExtractResult(
+        interaction_count=len(interactions), interactions=interactions
+    )
 
 
-def compute_relationship_strength(extract_payload: dict[str, Any]) -> RelationshipStrengthResult:
+def compute_relationship_strength(
+    extract_payload: dict[str, Any],
+) -> RelationshipStrengthResult:
     interactions = [
         InteractionCandidate.model_validate(item)
         for item in list(extract_payload.get("interactions", []))

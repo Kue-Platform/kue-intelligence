@@ -1,2 +1,1 @@
 """Inngest integration package."""
-

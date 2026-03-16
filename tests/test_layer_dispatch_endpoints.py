@@ -16,7 +16,9 @@ client = TestClient(app)
 
 
 def test_manual_layer2_capture_dispatches_pipeline_event() -> None:
-    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher("evt_layer2_manual")
+    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(
+        "evt_layer2_manual"
+    )
     response = client.post(
         "/v1/ingestion/layer2/capture",
         json={
@@ -45,10 +47,14 @@ def test_manual_layer2_capture_dispatches_pipeline_event() -> None:
 
 def test_canonicalization_replay_endpoint() -> None:
     raw_store = SqliteRawEventStore(db_path="/tmp/kue_test_raw_replay.db")
-    canonical_store = SqliteCanonicalEventStore(db_path="/tmp/kue_test_canonical_replay.db")
+    canonical_store = SqliteCanonicalEventStore(
+        db_path="/tmp/kue_test_canonical_replay.db"
+    )
     app.dependency_overrides[get_raw_event_store] = lambda: raw_store
     app.dependency_overrides[get_canonical_event_store] = lambda: canonical_store
-    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher("evt_replay_1")
+    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(
+        "evt_replay_1"
+    )
     raw_store.persist_source_events(
         [
             SourceEvent(
@@ -58,7 +64,10 @@ def test_canonicalization_replay_endpoint() -> None:
                 source_event_id="people/c_replay",
                 occurred_at=datetime.now(UTC),
                 trace_id="trace_abc",
-                payload={"resourceName": "people/c_replay", "names": [{"displayName": "Replay User"}]},
+                payload={
+                    "resourceName": "people/c_replay",
+                    "names": [{"displayName": "Replay User"}],
+                },
             )
         ]
     )

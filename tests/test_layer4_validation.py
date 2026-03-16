@@ -48,7 +48,10 @@ def test_layer4_validate_endpoint_returns_counts() -> None:
                 source_event_id="people/c_l4",
                 occurred_at=datetime.now(UTC),
                 trace_id="trace_layer4_1",
-                payload={"resourceName": "people/c_l4", "names": [{"displayName": "Layer Four"}]},
+                payload={
+                    "resourceName": "people/c_l4",
+                    "names": [{"displayName": "Layer Four"}],
+                },
             )
         ]
     )

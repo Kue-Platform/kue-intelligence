@@ -65,7 +65,9 @@ def _deterministic_embedding(text: str, dims: int = EMBEDDING_DIMS) -> list[floa
     return vector
 
 
-def build_embedding_requests(semantic_payload: dict[str, Any]) -> list[EmbeddingRequest]:
+def build_embedding_requests(
+    semantic_payload: dict[str, Any],
+) -> list[EmbeddingRequest]:
     docs = list(semantic_payload.get("documents", []))
     output: list[EmbeddingRequest] = []
     for doc in docs:
@@ -127,13 +129,17 @@ def generate_embeddings(misses: list[EmbeddingRequest]) -> EmbeddingGenerationRe
                 embedding=embedding,
             )
         )
-    return EmbeddingGenerationResult(generated_count=len(generated), generated=generated)
+    return EmbeddingGenerationResult(
+        generated_count=len(generated), generated=generated
+    )
 
 
 def embedding_cache_store(records: list[EmbeddingVectorRecord]) -> int:
     with _CACHE_LOCK:
         for record in records:
-            _EMBEDDING_CACHE[_text_key(record.doc_type, record.content)] = record.embedding
+            _EMBEDDING_CACHE[_text_key(record.doc_type, record.content)] = (
+                record.embedding
+            )
     return len(records)
 
 

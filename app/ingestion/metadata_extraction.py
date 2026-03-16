@@ -32,7 +32,9 @@ def _tagify(prefix: str, value: str | None) -> str | None:
     return f"{prefix}:{normalized.lower().replace(' ', '_')}"
 
 
-def extract_metadata_candidates(enrichment_payload: dict[str, Any]) -> MetadataExtractResult:
+def extract_metadata_candidates(
+    enrichment_payload: dict[str, Any],
+) -> MetadataExtractResult:
     parsed_events = list(enrichment_payload.get("parsed_events", []))
     candidates: list[MetadataCandidate] = []
 

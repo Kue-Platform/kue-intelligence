@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -33,7 +32,9 @@ class EntityStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def upsert_entities(self, resolved_entities: list[EntityCandidate]) -> EntityPersistResult:
+    def upsert_entities(
+        self, resolved_entities: list[EntityCandidate]
+    ) -> EntityPersistResult:
         raise NotImplementedError
 
     @abstractmethod
@@ -135,7 +136,9 @@ class SqliteEntityStore(EntityStore):
                 return str(row[0])
         return None
 
-    def upsert_entities(self, resolved_entities: list[EntityCandidate]) -> EntityPersistResult:
+    def upsert_entities(
+        self, resolved_entities: list[EntityCandidate]
+    ) -> EntityPersistResult:
         if not resolved_entities:
             return EntityPersistResult(0, 0, 0, 0)
 
@@ -247,7 +250,9 @@ class SqliteEntityStore(EntityStore):
                     if row is None:
                         continue
                     try:
-                        existing_metadata = json.loads(str(row["metadata_json"] or "{}"))
+                        existing_metadata = json.loads(
+                            str(row["metadata_json"] or "{}")
+                        )
                     except json.JSONDecodeError:
                         existing_metadata = {}
                     merged_metadata = dict(existing_metadata)
@@ -301,16 +306,21 @@ class SupabaseEntityStore(EntityStore):
     @property
     def _upsert_headers(self) -> dict[str, str]:
         """Headers for a native PostgREST upsert (on_conflict + merge-duplicates)."""
-        return {**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"}
+        return {
+            **self._base_headers,
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
 
-    def _bulk_fetch_entities_by_email(self, tenant_id: str, emails: list[str]) -> dict[str, str]:
+    def _bulk_fetch_entities_by_email(
+        self, tenant_id: str, emails: list[str]
+    ) -> dict[str, str]:
         """Return {primary_email -> entity_id} for all known emails in one GET."""
         if not emails:
             return {}
         unique_emails = list(set(emails))
         result: dict[str, str] = {}
         for i in range(0, len(unique_emails), 50):
-            chunk = unique_emails[i:i + 50]
+            chunk = unique_emails[i : i + 50]
             response = httpx.get(
                 self._url("entities"),
                 headers=self._base_headers,
@@ -325,14 +335,19 @@ class SupabaseEntityStore(EntityStore):
                 raise RuntimeError(
                     f"Supabase entities bulk fetch failed ({response.status_code}): {response.text}"
                 )
-            result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
+            result.update(
+                {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
+            )
         return result
 
-    def upsert_entities(self, resolved_entities: list[EntityCandidate]) -> EntityPersistResult:
+    def upsert_entities(
+        self, resolved_entities: list[EntityCandidate]
+    ) -> EntityPersistResult:
         if not resolved_entities:
             return EntityPersistResult(0, 0, 0, 0)
 
         from collections import defaultdict
+
         by_tenant: dict[str, list[EntityCandidate]] = defaultdict(list)
         for c in resolved_entities:
             by_tenant[c.tenant_id].append(c)
@@ -345,8 +360,12 @@ class SupabaseEntityStore(EntityStore):
             known_by_email = self._bulk_fetch_entities_by_email(tenant_id, emails)
 
             # Split into new vs existing
-            new_candidates = [c for c in candidates if not known_by_email.get(c.primary_email)]
-            existing_candidates = [c for c in candidates if known_by_email.get(c.primary_email)]
+            new_candidates = [
+                c for c in candidates if not known_by_email.get(c.primary_email)
+            ]
+            existing_candidates = [
+                c for c in candidates if known_by_email.get(c.primary_email)
+            ]
 
             entity_id_map: dict[str, str] = {}
             for c in existing_candidates:
@@ -373,7 +392,10 @@ class SupabaseEntityStore(EntityStore):
                     raise RuntimeError(
                         f"Supabase entities bulk insert failed ({ins_resp.status_code}): {ins_resp.text}"
                     )
-                returned = {row.get("primary_email"): str(row["entity_id"]) for row in ins_resp.json()}
+                returned = {
+                    row.get("primary_email"): str(row["entity_id"])
+                    for row in ins_resp.json()
+                }
                 for c in new_candidates:
                     eid = returned.get(c.primary_email)
                     if eid:
@@ -443,13 +465,16 @@ class SupabaseEntityStore(EntityStore):
                     )
                 total_identities += len(identity_rows)
 
-        return EntityPersistResult(len(resolved_entities), total_created, total_updated, total_identities)
+        return EntityPersistResult(
+            len(resolved_entities), total_created, total_updated, total_identities
+        )
 
     def upsert_metadata(self, metadata_candidates: list[MetadataCandidate]) -> int:
         if not metadata_candidates:
             return 0
 
         from collections import defaultdict
+
         # Group by tenant (almost always one, but be safe)
         by_tenant: dict[str, list[MetadataCandidate]] = defaultdict(list)
         for item in metadata_candidates:
@@ -464,7 +489,7 @@ class SupabaseEntityStore(EntityStore):
             unique_emails = list(set(emails))
             existing_by_email: dict[str, dict] = {}
             for i in range(0, len(unique_emails), 50):
-                chunk = unique_emails[i:i + 50]
+                chunk = unique_emails[i : i + 50]
                 existing_resp = httpx.get(
                     self._url("entities"),
                     headers=self._base_headers,
@@ -479,7 +504,9 @@ class SupabaseEntityStore(EntityStore):
                     raise RuntimeError(
                         f"Supabase entities metadata bulk fetch failed ({existing_resp.status_code}): {existing_resp.text}"
                     )
-                existing_by_email.update({row["primary_email"]: row for row in existing_resp.json()})
+                existing_by_email.update(
+                    {row["primary_email"]: row for row in existing_resp.json()}
+                )
 
             # Deduplicate by entity_id: same entity may appear from multiple sources
             # (contacts + gmail + calendar). Postgres raises PG21000 if the same
@@ -502,9 +529,16 @@ class SupabaseEntityStore(EntityStore):
                     }
                 # Layer on the new metadata (last write wins per key)
                 deduped[eid]["metadata_json"].update(item.metadata_json)
-                deduped[eid]["company_norm"] = item.metadata_json.get("company_norm") or deduped[eid]["company_norm"]
-                deduped[eid]["title_norm"] = item.metadata_json.get("title_norm") or deduped[eid]["title_norm"]
-                deduped[eid]["display_name"] = item.display_name or deduped[eid]["display_name"]
+                deduped[eid]["company_norm"] = (
+                    item.metadata_json.get("company_norm")
+                    or deduped[eid]["company_norm"]
+                )
+                deduped[eid]["title_norm"] = (
+                    item.metadata_json.get("title_norm") or deduped[eid]["title_norm"]
+                )
+                deduped[eid]["display_name"] = (
+                    item.display_name or deduped[eid]["display_name"]
+                )
 
             update_rows = list(deduped.values())
 

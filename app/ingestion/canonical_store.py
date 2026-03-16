@@ -92,7 +92,12 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
                 )
                 """
             )
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(canonical_events)").fetchall()}
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(canonical_events)"
+                ).fetchall()
+            }
             if "run_id" not in columns:
                 conn.execute("ALTER TABLE canonical_events ADD COLUMN run_id TEXT")
             if "parse_status" not in columns:
@@ -104,7 +109,9 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
                     "ALTER TABLE canonical_events ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'v1'"
                 )
             if "canonical_hash" not in columns:
-                conn.execute("ALTER TABLE canonical_events ADD COLUMN canonical_hash TEXT")
+                conn.execute(
+                    "ALTER TABLE canonical_events ADD COLUMN canonical_hash TEXT"
+                )
             conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_events_dedup
@@ -146,7 +153,9 @@ class SqliteCanonicalEventStore(CanonicalEventStore):
                 parse_status,
                 schema_version,
                 hashlib.sha256(
-                    json.dumps(event.normalized, sort_keys=True, ensure_ascii=True).encode("utf-8")
+                    json.dumps(
+                        event.normalized, sort_keys=True, ensure_ascii=True
+                    ).encode("utf-8")
                 ).hexdigest(),
                 parser_version,
                 parsed_at.isoformat(),
@@ -248,7 +257,9 @@ class SupabaseCanonicalEventStore(CanonicalEventStore):
         payload: list[dict[str, Any]] = []
         for event in parsed_events:
             canonical_hash = hashlib.sha256(
-                json.dumps(event.normalized, sort_keys=True, ensure_ascii=True).encode("utf-8")
+                json.dumps(event.normalized, sort_keys=True, ensure_ascii=True).encode(
+                    "utf-8"
+                )
             ).hexdigest()
             payload.append(
                 {

@@ -11,7 +11,9 @@ def test_ingestion_mock_google_contacts() -> None:
         json={
             "source": "google_contacts",
             "trigger_type": "manual",
-            "payload": {"contacts": [{"name": "Alan Turing"}, {"name": "Rachel Carson"}]},
+            "payload": {
+                "contacts": [{"name": "Alan Turing"}, {"name": "Rachel Carson"}]
+            },
         },
     )
 
@@ -68,4 +70,3 @@ def test_ingestion_mock_invalid_payload_returns_400() -> None:
 
     assert response.status_code == 400
     assert "messages" in response.json()["detail"]
-

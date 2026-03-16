@@ -12,7 +12,9 @@ client = TestClient(app)
 
 
 def test_google_oauth_callback_mock_contacts() -> None:
-    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher("evt_mock_1")
+    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(
+        "evt_mock_1"
+    )
     response = client.post(
         "/v1/ingestion/google/oauth/callback/mock",
         json={
@@ -24,7 +26,9 @@ def test_google_oauth_callback_mock_contacts() -> None:
                     {
                         "resourceName": "people/c_1",
                         "names": [{"displayName": "Alan Turing"}],
-                        "metadata": {"sources": [{"updateTime": "2025-01-01T10:00:00Z"}]},
+                        "metadata": {
+                            "sources": [{"updateTime": "2025-01-01T10:00:00Z"}]
+                        },
                     }
                 ]
             },
@@ -40,7 +44,9 @@ def test_google_oauth_callback_mock_contacts() -> None:
 
 
 def test_google_oauth_callback_mock_gmail() -> None:
-    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher("evt_mock_2")
+    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(
+        "evt_mock_2"
+    )
     response = client.post(
         "/v1/ingestion/google/oauth/callback/mock",
         json={
@@ -68,7 +74,9 @@ def test_google_oauth_callback_mock_gmail() -> None:
 
 
 def test_google_oauth_callback_mock_calendar() -> None:
-    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher("evt_mock_3")
+    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(
+        "evt_mock_3"
+    )
     response = client.post(
         "/v1/ingestion/google/oauth/callback/mock",
         json={
@@ -110,9 +118,7 @@ def test_google_oauth_callback_mock_requires_identity_context() -> None:
 
 def test_raw_events_lookup_by_trace_id() -> None:
     tmpdir = tempfile.mkdtemp(prefix="kue_raw_")
-    store = SqliteRawEventStore(
-        db_path=f"{tmpdir}/raw_events.db"
-    )
+    store = SqliteRawEventStore(db_path=f"{tmpdir}/raw_events.db")
     app.dependency_overrides[get_raw_event_store] = lambda: store
     store.persist_source_events(
         [

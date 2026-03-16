@@ -300,8 +300,12 @@ class SqlitePipelineStore(PipelineStore):
                     (
                         status,
                         now if status in {"succeeded", "failed", "partial"} else None,
-                        json.dumps(error_json, ensure_ascii=True) if error_json else None,
-                        json.dumps(metadata, ensure_ascii=True) if metadata is not None else None,
+                        json.dumps(error_json, ensure_ascii=True)
+                        if error_json
+                        else None,
+                        json.dumps(metadata, ensure_ascii=True)
+                        if metadata is not None
+                        else None,
                         run_id,
                     ),
                 )
@@ -347,7 +351,9 @@ class SqlitePipelineStore(PipelineStore):
                         (run_id, stage_key, layer_key, attempt),
                     ).fetchone()
                     if row is None:
-                        raise RuntimeError("Failed to resolve stage_run_id after upsert")
+                        raise RuntimeError(
+                            "Failed to resolve stage_run_id after upsert"
+                        )
                     stage_run_id = int(row[0])
                 conn.commit()
                 return stage_run_id
@@ -384,7 +390,9 @@ class SqlitePipelineStore(PipelineStore):
                         now,
                         duration_ms,
                         records_out,
-                        json.dumps(error_json, ensure_ascii=True) if error_json else None,
+                        json.dumps(error_json, ensure_ascii=True)
+                        if error_json
+                        else None,
                         stage_run_id,
                     ),
                 )
@@ -416,9 +424,13 @@ class SqlitePipelineStore(PipelineStore):
             trigger_type=str(row["trigger_type"]),
             status=str(row["status"]),
             requested_at=datetime.fromisoformat(str(row["requested_at"])),
-            started_at=datetime.fromisoformat(str(row["started_at"])) if row["started_at"] else None,
+            started_at=datetime.fromisoformat(str(row["started_at"]))
+            if row["started_at"]
+            else None,
             completed_at=(
-                datetime.fromisoformat(str(row["completed_at"])) if row["completed_at"] else None
+                datetime.fromisoformat(str(row["completed_at"]))
+                if row["completed_at"]
+                else None
             ),
         )
 
@@ -444,14 +456,19 @@ class SupabasePipelineStore(PipelineStore):
         if response.status_code == 409:
             return True
         body = (response.text or "").lower()
-        return "23505" in body or "duplicate key value violates unique constraint" in body
+        return (
+            "23505" in body or "duplicate key value violates unique constraint" in body
+        )
 
     def ensure_tenant_user(self, tenant_id: str, user_id: str) -> None:
         now = _utc_now().isoformat()
 
         tenant_resp = httpx.post(
             self._url("tenants"),
-            headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            headers={
+                **self._base_headers,
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
             params={"on_conflict": "tenant_id"},
             json=[{"tenant_id": tenant_id, "name": tenant_id, "updated_at": now}],
             timeout=20.0,
@@ -463,7 +480,10 @@ class SupabasePipelineStore(PipelineStore):
 
         user_resp = httpx.post(
             self._url("tenant_users"),
-            headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            headers={
+                **self._base_headers,
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
             params={"on_conflict": "tenant_id,user_id"},
             json=[{"tenant_id": tenant_id, "user_id": user_id, "updated_at": now}],
             timeout=20.0,
@@ -694,7 +714,9 @@ class SupabasePipelineStore(PipelineStore):
 
         rows = response.json()
         if not rows:
-            raise RuntimeError("Supabase pipeline_stage_runs insert returned empty result")
+            raise RuntimeError(
+                "Supabase pipeline_stage_runs insert returned empty result"
+            )
         return int(rows[0]["id"])
 
     def finish_stage_run(
@@ -720,7 +742,9 @@ class SupabasePipelineStore(PipelineStore):
         rows = read_response.json()
         duration_ms = None
         if rows and rows[0].get("started_at"):
-            started = datetime.fromisoformat(str(rows[0]["started_at"]).replace("Z", "+00:00"))
+            started = datetime.fromisoformat(
+                str(rows[0]["started_at"]).replace("Z", "+00:00")
+            )
             duration_ms = int((_utc_now() - started).total_seconds() * 1000)
 
         body: dict[str, Any] = {
@@ -757,7 +781,11 @@ class SupabasePipelineStore(PipelineStore):
         response = httpx.get(
             self._url("pipeline_runs"),
             headers=self._base_headers,
-            params={"trace_id": f"eq.{trace_id}", "order": "requested_at.desc", "limit": 1},
+            params={
+                "trace_id": f"eq.{trace_id}",
+                "order": "requested_at.desc",
+                "limit": 1,
+            },
             timeout=20.0,
         )
         if response.status_code >= 400:
@@ -776,7 +804,9 @@ class SupabasePipelineStore(PipelineStore):
             source=str(row["source"]) if row.get("source") else None,
             trigger_type=str(row["trigger_type"]),
             status=str(row["status"]),
-            requested_at=datetime.fromisoformat(str(row["requested_at"]).replace("Z", "+00:00")),
+            requested_at=datetime.fromisoformat(
+                str(row["requested_at"]).replace("Z", "+00:00")
+            ),
             started_at=(
                 datetime.fromisoformat(str(row["started_at"]).replace("Z", "+00:00"))
                 if row.get("started_at")

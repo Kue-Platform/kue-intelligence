@@ -140,7 +140,10 @@ def test_layer3_events_lookup_returns_persisted_records() -> None:
                 source_event_id="people/c_77",
                 occurred_at=now,
                 trace_id=trace_id,
-                payload={"resourceName": "people/c_77", "names": [{"displayName": "Phoebe Buffay"}]},
+                payload={
+                    "resourceName": "people/c_77",
+                    "names": [{"displayName": "Phoebe Buffay"}],
+                },
             )
         ]
     )

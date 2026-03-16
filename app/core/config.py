@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     turso_url: str = ""
     turso_auth_token: str = ""
 
+    jwt_secret: str = "changeme-set-JWT_SECRET-in-env"
+    jwt_expiry_seconds: int = 604800  # 7 days
+    otp_expiry_seconds: int = 600  # 10 minutes
+    auth_db_path: str = "data/auth.db"
+    auth_google_redirect_uri: str = ""
+
     supabase_url: str = ""
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""

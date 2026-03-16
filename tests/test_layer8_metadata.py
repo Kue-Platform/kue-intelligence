@@ -33,7 +33,9 @@ def test_layer8_metadata_endpoint_updates_entity_metadata() -> None:
                     "resourceName": "people/c_l8",
                     "names": [{"displayName": "Rachel Lee"}],
                     "emailAddresses": [{"value": "rachel@stripe.com"}],
-                    "organizations": [{"name": "stripe", "title": "engineering manager"}],
+                    "organizations": [
+                        {"name": "stripe", "title": "engineering manager"}
+                    ],
                 },
             )
         ]

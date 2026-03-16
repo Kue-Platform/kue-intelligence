@@ -28,7 +28,9 @@ class SearchIndexStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def apply_hybrid_signals(self, signals: list[HybridSignal]) -> SearchIndexPersistResult:
+    def apply_hybrid_signals(
+        self, signals: list[HybridSignal]
+    ) -> SearchIndexPersistResult:
         raise NotImplementedError
 
     @abstractmethod
@@ -74,7 +76,9 @@ class SqliteSearchIndexStore(SearchIndexStore):
             )
             conn.commit()
 
-    def apply_hybrid_signals(self, signals: list[HybridSignal]) -> SearchIndexPersistResult:
+    def apply_hybrid_signals(
+        self, signals: list[HybridSignal]
+    ) -> SearchIndexPersistResult:
         if not signals:
             return SearchIndexPersistResult(0, 0)
         applied = 0
@@ -174,14 +178,16 @@ class SupabaseSearchIndexStore(SearchIndexStore):
     def _url(self, table: str) -> str:
         return f"{self._supabase_url}/rest/v1/{table}"
 
-    def _bulk_resolve_entity_ids(self, tenant_id: str, emails: list[str]) -> dict[str, str]:
+    def _bulk_resolve_entity_ids(
+        self, tenant_id: str, emails: list[str]
+    ) -> dict[str, str]:
         """Return {primary_email -> entity_id} for all given emails in one GET."""
         if not emails:
             return {}
         unique_emails = list(set(emails))
         result: dict[str, str] = {}
         for i in range(0, len(unique_emails), 50):
-            chunk = unique_emails[i:i + 50]
+            chunk = unique_emails[i : i + 50]
             response = httpx.get(
                 self._url("entities"),
                 headers=self._base_headers,
@@ -196,14 +202,19 @@ class SupabaseSearchIndexStore(SearchIndexStore):
                 raise RuntimeError(
                     f"Supabase entity bulk lookup for indexing failed ({response.status_code}): {response.text}"
                 )
-            result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
+            result.update(
+                {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
+            )
         return result
 
-    def apply_hybrid_signals(self, signals: list[HybridSignal]) -> SearchIndexPersistResult:
+    def apply_hybrid_signals(
+        self, signals: list[HybridSignal]
+    ) -> SearchIndexPersistResult:
         if not signals:
             return SearchIndexPersistResult(0, 0)
 
         from collections import defaultdict
+
         by_tenant: dict[str, list[HybridSignal]] = defaultdict(list)
         for s in signals:
             by_tenant[s.tenant_id].append(s)
@@ -227,7 +238,7 @@ class SupabaseSearchIndexStore(SearchIndexStore):
 
             doc_by_key: dict[tuple[str, str, str], dict] = {}
             for i in range(0, len(entity_ids), 50):
-                chunk = entity_ids[i:i + 50]
+                chunk = entity_ids[i : i + 50]
                 doc_resp = httpx.get(
                     self._url("search_documents"),
                     headers=self._base_headers,
@@ -243,7 +254,11 @@ class SupabaseSearchIndexStore(SearchIndexStore):
                         f"Supabase search_documents bulk fetch failed ({doc_resp.status_code}): {doc_resp.text}"
                     )
                 for row in doc_resp.json():
-                    key = (str(row["entity_id"]), str(row["doc_type"]), str(row["content"]))
+                    key = (
+                        str(row["entity_id"]),
+                        str(row["doc_type"]),
+                        str(row["content"]),
+                    )
                     doc_by_key[key] = row
 
             # Deduplicate by `id` — same doc can match multiple signals (same entity,
@@ -278,7 +293,10 @@ class SupabaseSearchIndexStore(SearchIndexStore):
             if update_rows:
                 bulk_patch = httpx.post(
                     self._url("search_documents"),
-                    headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                    headers={
+                        **self._base_headers,
+                        "Prefer": "resolution=merge-duplicates,return=minimal",
+                    },
                     params={"on_conflict": "id"},
                     json=update_rows,
                     timeout=30.0,

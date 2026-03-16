@@ -278,4 +278,3 @@ def parse_raw_events(raw_events: list[RawCapturedEvent]) -> ParseResult:
             )
 
     return ParseResult(parsed_events=parsed, failures=failures)
-

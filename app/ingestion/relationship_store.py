@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any
 
 import httpx
 
 from app.core.config import Settings
 from app.ingestion.db import get_connection
-from app.ingestion.relationship_extraction import InteractionCandidate, RelationshipAggregate
+from app.ingestion.relationship_extraction import (
+    InteractionCandidate,
+    RelationshipAggregate,
+)
 
 
 @dataclass
@@ -169,14 +170,16 @@ class SupabaseRelationshipStore(RelationshipStore):
         body = (response.text or "").lower()
         return response.status_code == 409 or "23505" in body
 
-    def _bulk_resolve_entity_ids(self, tenant_id: str, emails: list[str]) -> dict[str, str]:
+    def _bulk_resolve_entity_ids(
+        self, tenant_id: str, emails: list[str]
+    ) -> dict[str, str]:
         """Return {email -> entity_id} for all given emails in one GET."""
         if not emails:
             return {}
         unique_emails = list(set(emails))
         result: dict[str, str] = {}
         for i in range(0, len(unique_emails), 50):
-            chunk = unique_emails[i:i + 50]
+            chunk = unique_emails[i : i + 50]
             response = httpx.get(
                 self._url("entities"),
                 headers=self._base_headers,
@@ -191,7 +194,9 @@ class SupabaseRelationshipStore(RelationshipStore):
                 raise RuntimeError(
                     f"Supabase entities bulk lookup failed ({response.status_code}): {response.text}"
                 )
-            result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
+            result.update(
+                {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
+            )
         return result
 
     def persist(
@@ -230,6 +235,7 @@ class SupabaseRelationshipStore(RelationshipStore):
             )
 
         from collections import defaultdict
+
         by_tenant: dict[str, list[RelationshipAggregate]] = defaultdict(list)
         for rel in relationships:
             by_tenant[rel.tenant_id].append(rel)
@@ -237,7 +243,9 @@ class SupabaseRelationshipStore(RelationshipStore):
         total_upserted = 0
 
         for tenant_id, rels in by_tenant.items():
-            all_emails = list({email for rel in rels for email in (rel.from_email, rel.to_email)})
+            all_emails = list(
+                {email for rel in rels for email in (rel.from_email, rel.to_email)}
+            )
             email_to_id = self._bulk_resolve_entity_ids(tenant_id, all_emails)
 
             # Build rows — deduplicate on (tenant_id, from, to, type) which is the
@@ -268,8 +276,13 @@ class SupabaseRelationshipStore(RelationshipStore):
             # on_conflict=(tenant_id,from_entity_id,to_entity_id,relationship_type)
             upsert_resp = httpx.post(
                 self._url("relationships"),
-                headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
-                params={"on_conflict": "tenant_id,from_entity_id,to_entity_id,relationship_type"},
+                headers={
+                    **self._base_headers,
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+                params={
+                    "on_conflict": "tenant_id,from_entity_id,to_entity_id,relationship_type"
+                },
                 json=rows,
                 timeout=30.0,
             )

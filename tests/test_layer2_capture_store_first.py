@@ -6,12 +6,12 @@ Verifies that:
   3. The response carries the pre-created run_id and correct trace_id.
   4. Dispatching large batches (that would previously exceed 256 KB) succeeds.
 """
+
 import tempfile
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.api.ingestion_routes import (
@@ -22,7 +22,6 @@ from app.api.ingestion_routes import (
 from app.ingestion.pipeline_store import PipelineStore
 from app.ingestion.raw_store import SqliteRawEventStore
 from app.main import app
-from app.schemas import IngestionSource, SourceEvent
 
 client = TestClient(app)
 
@@ -66,12 +65,16 @@ def test_layer2_capture_stores_events_before_dispatch():
 
         app.dependency_overrides[get_raw_event_store] = lambda: raw_store
         app.dependency_overrides[get_pipeline_store] = lambda: mock_pipeline
-        app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(dispatched)
+        app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(
+            dispatched
+        )
 
         trace_id = "trace_store_first_001"
         response = client.post(
             "/v1/ingestion/layer2/capture",
-            json={"source_events": [_make_event(1, trace_id), _make_event(2, trace_id)]},
+            json={
+                "source_events": [_make_event(1, trace_id), _make_event(2, trace_id)]
+            },
         )
         app.dependency_overrides.clear()
 
@@ -106,7 +109,9 @@ def test_layer2_capture_lightweight_event_for_large_batch():
 
         app.dependency_overrides[get_raw_event_store] = lambda: raw_store
         app.dependency_overrides[get_pipeline_store] = lambda: mock_pipeline
-        app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(dispatched)
+        app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(
+            dispatched
+        )
 
         trace_id = "trace_store_first_large"
         # 500 events with fat payloads — would be ~300+ KB if embedded
@@ -121,6 +126,7 @@ def test_layer2_capture_lightweight_event_for_large_batch():
     assert response.status_code == 200, response.text
 
     import json
+
     evt_data = dispatched[0]["data"]
     payload_bytes = len(json.dumps(evt_data).encode())
     assert payload_bytes < 262_144, (

@@ -42,7 +42,9 @@ def extract_entity_candidates(enrichment_payload: dict[str, Any]) -> ExactMatchR
         primary_email = None
         if isinstance(emails, list) and emails:
             primary_email = str(emails[0]).strip().lower() or None
-        display_name = str(normalized.get("full_name") or "Unknown").strip() or "Unknown"
+        display_name = (
+            str(normalized.get("full_name") or "Unknown").strip() or "Unknown"
+        )
         candidates.append(
             EntityCandidate(
                 raw_event_id=int(event["raw_event_id"]),
@@ -53,9 +55,15 @@ def extract_entity_candidates(enrichment_payload: dict[str, Any]) -> ExactMatchR
                 display_name=display_name,
                 primary_email=primary_email,
                 company_norm=(
-                    str(normalized.get("company")).strip() if normalized.get("company") else None
+                    str(normalized.get("company")).strip()
+                    if normalized.get("company")
+                    else None
                 ),
-                title_norm=(str(normalized.get("title")).strip() if normalized.get("title") else None),
+                title_norm=(
+                    str(normalized.get("title")).strip()
+                    if normalized.get("title")
+                    else None
+                ),
                 metadata_json={"tags": normalized.get("tags", [])},
             )
         )
@@ -77,4 +85,6 @@ def merge_entity_candidates(exact_match_payload: dict[str, Any]) -> MergeResult:
         )
         dedup[key] = candidate
     resolved_entities = list(dedup.values())
-    return MergeResult(resolved_count=len(resolved_entities), resolved_entities=resolved_entities)
+    return MergeResult(
+        resolved_count=len(resolved_entities), resolved_entities=resolved_entities
+    )

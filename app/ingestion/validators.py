@@ -76,7 +76,9 @@ def _validate_single_event(event_type: str, normalized: dict[str, Any]) -> None:
     raise ValueError(f"unsupported_event_type:{event_type}")
 
 
-def validate_parsed_events(parse_result_payload: dict[str, Any]) -> CanonicalValidationResult:
+def validate_parsed_events(
+    parse_result_payload: dict[str, Any],
+) -> CanonicalValidationResult:
     parsed_events = list(parse_result_payload.get("parsed_events", []))
     valid_events: list[dict[str, Any]] = []
     invalid_events: list[CanonicalValidationFailure] = []

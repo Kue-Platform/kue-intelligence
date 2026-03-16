@@ -282,7 +282,9 @@ class Neo4jGraphStore(GraphStore):
 
         by_type = {
             "KNOWS": self._run_write(knows_q, knows) if knows else 0,
-            "INTERACTED_WITH": self._run_write(interacted_q, interacted) if interacted else 0,
+            "INTERACTED_WITH": self._run_write(interacted_q, interacted)
+            if interacted
+            else 0,
             "WORKS_AT": self._run_write(works_at_q, works_at) if works_at else 0,
             "MEMBER_OF": self._run_write(member_of_q, member_of) if member_of else 0,
             "HAS_TOPIC": self._run_write(has_topic_q, has_topic) if has_topic else 0,
@@ -298,7 +300,12 @@ class Neo4jGraphStore(GraphStore):
     def verify(self, snapshot: dict[str, Any]) -> dict[str, Any]:
         tenant_id = str(snapshot.get("tenant_id") or "")
         if not tenant_id:
-            return {"enabled": True, "ok": False, "counts": {}, "mismatches": ["missing_tenant_id"]}
+            return {
+                "enabled": True,
+                "ok": False,
+                "counts": {},
+                "mismatches": ["missing_tenant_id"],
+            }
 
         node_counts = self._run_query(
             """
@@ -338,10 +345,14 @@ class Neo4jGraphStore(GraphStore):
         mismatches: list[str] = []
         for key, expected in expected_nodes.items():
             if actual_nodes.get(key, 0) < expected:
-                mismatches.append(f"node:{key}:expected>={expected}:actual={actual_nodes.get(key, 0)}")
+                mismatches.append(
+                    f"node:{key}:expected>={expected}:actual={actual_nodes.get(key, 0)}"
+                )
         for key, expected in expected_edges.items():
             if actual_edges.get(key, 0) < expected:
-                mismatches.append(f"edge:{key}:expected>={expected}:actual={actual_edges.get(key, 0)}")
+                mismatches.append(
+                    f"edge:{key}:expected>={expected}:actual={actual_edges.get(key, 0)}"
+                )
 
         return {
             "enabled": True,
@@ -357,7 +368,11 @@ class Neo4jGraphStore(GraphStore):
 
 
 def create_graph_store(settings: Settings) -> GraphStore:
-    if not settings.neo4j_uri or not settings.neo4j_username or not settings.neo4j_password:
+    if (
+        not settings.neo4j_uri
+        or not settings.neo4j_username
+        or not settings.neo4j_password
+    ):
         return NoopGraphStore()
     return Neo4jGraphStore(
         uri=settings.neo4j_uri,

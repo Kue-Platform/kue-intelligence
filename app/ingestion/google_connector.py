@@ -17,8 +17,12 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 GOOGLE_CONTACTS_URL = "https://people.googleapis.com/v1/people/me/connections"
 GOOGLE_GMAIL_LIST_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
-GOOGLE_GMAIL_GET_URL_TMPL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}"
-GOOGLE_CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+GOOGLE_GMAIL_GET_URL_TMPL = (
+    "https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}"
+)
+GOOGLE_CALENDAR_EVENTS_URL = (
+    "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+)
 
 
 class GoogleConnectorError(RuntimeError):
@@ -62,13 +66,19 @@ def resolve_google_state(
     if tenant_id and user_id:
         return tenant_id, user_id
     if not state:
-        raise GoogleConnectorError("Missing tenant_id/user_id. Provide query params or encoded state.")
+        raise GoogleConnectorError(
+            "Missing tenant_id/user_id. Provide query params or encoded state."
+        )
 
     try:
-        decoded = base64.urlsafe_b64decode(state + "=" * (-len(state) % 4)).decode("utf-8")
+        decoded = base64.urlsafe_b64decode(state + "=" * (-len(state) % 4)).decode(
+            "utf-8"
+        )
         parsed = json.loads(decoded)
     except (ValueError, json.JSONDecodeError) as exc:
-        raise GoogleConnectorError("Invalid OAuth state. Expected base64url JSON.") from exc
+        raise GoogleConnectorError(
+            "Invalid OAuth state. Expected base64url JSON."
+        ) from exc
 
     parsed_tenant_id = parsed.get("tenant_id")
     parsed_user_id = parsed.get("user_id")
@@ -88,10 +98,18 @@ class GoogleOAuthConnector:
         access_token = str(token_payload["access_token"])
 
         async with httpx.AsyncClient(timeout=20.0) as client:
-            userinfo_task = self._fetch_userinfo(client=client, access_token=access_token)
-            contacts_task = self._fetch_contacts(client=client, access_token=access_token)
-            gmail_task = self._fetch_gmail_messages(client=client, access_token=access_token)
-            calendar_task = self._fetch_calendar_events(client=client, access_token=access_token)
+            userinfo_task = self._fetch_userinfo(
+                client=client, access_token=access_token
+            )
+            contacts_task = self._fetch_contacts(
+                client=client, access_token=access_token
+            )
+            gmail_task = self._fetch_gmail_messages(
+                client=client, access_token=access_token
+            )
+            calendar_task = self._fetch_calendar_events(
+                client=client, access_token=access_token
+            )
             userinfo, contacts, gmail_messages, calendar_events = await asyncio.gather(
                 userinfo_task,
                 contacts_task,
@@ -100,9 +118,15 @@ class GoogleOAuthConnector:
             )
 
         source_events: list[SourceEvent] = []
-        source_events.extend(self._to_contact_events(context=context, contacts=contacts))
-        source_events.extend(self._to_gmail_events(context=context, messages=gmail_messages))
-        source_events.extend(self._to_calendar_events(context=context, events=calendar_events))
+        source_events.extend(
+            self._to_contact_events(context=context, contacts=contacts)
+        )
+        source_events.extend(
+            self._to_gmail_events(context=context, messages=gmail_messages)
+        )
+        source_events.extend(
+            self._to_calendar_events(context=context, events=calendar_events)
+        )
         return source_events, self._build_connection_details(
             context=context,
             token_payload=token_payload,
@@ -115,7 +139,9 @@ class GoogleOAuthConnector:
         code: str,
         context: GoogleOAuthContext,
     ) -> list[SourceEvent]:
-        source_events, _ = await self.handle_callback_with_connection(code=code, context=context)
+        source_events, _ = await self.handle_callback_with_connection(
+            code=code, context=context
+        )
         return source_events
 
     def handle_mock_callback(
@@ -140,7 +166,9 @@ class GoogleOAuthConnector:
             or not settings.google_oauth_client_secret
             or not settings.google_oauth_redirect_uri
         ):
-            raise GoogleConnectorError("Google OAuth settings are missing in environment.")
+            raise GoogleConnectorError(
+                "Google OAuth settings are missing in environment."
+            )
 
         payload = {
             "code": code,
@@ -153,11 +181,15 @@ class GoogleOAuthConnector:
         async with httpx.AsyncClient(timeout=20.0) as client:
             response = await client.post(GOOGLE_TOKEN_URL, data=payload)
         if response.status_code >= 400:
-            raise GoogleConnectorError(f"Token exchange failed with status {response.status_code}.")
+            raise GoogleConnectorError(
+                f"Token exchange failed with status {response.status_code}."
+            )
         token_payload = response.json()
         token = token_payload.get("access_token")
         if not token:
-            raise GoogleConnectorError("Token exchange succeeded but access_token is missing.")
+            raise GoogleConnectorError(
+                "Token exchange succeeded but access_token is missing."
+            )
         return dict(token_payload)
 
     def _build_connection_details(
@@ -188,16 +220,22 @@ class GoogleOAuthConnector:
             token_expires_at=token_expires_at,
         )
 
-    async def _fetch_userinfo(self, *, client: httpx.AsyncClient, access_token: str) -> dict[str, Any]:
+    async def _fetch_userinfo(
+        self, *, client: httpx.AsyncClient, access_token: str
+    ) -> dict[str, Any]:
         response = await client.get(
             GOOGLE_USERINFO_URL,
             headers={"Authorization": f"Bearer {access_token}"},
         )
         if response.status_code >= 400:
-            raise GoogleConnectorError(f"Failed to fetch user info: {response.status_code}.")
+            raise GoogleConnectorError(
+                f"Failed to fetch user info: {response.status_code}."
+            )
         return response.json()
 
-    async def _fetch_contacts(self, *, client: httpx.AsyncClient, access_token: str) -> list[dict[str, Any]]:
+    async def _fetch_contacts(
+        self, *, client: httpx.AsyncClient, access_token: str
+    ) -> list[dict[str, Any]]:
         response = await client.get(
             GOOGLE_CONTACTS_URL,
             headers={"Authorization": f"Bearer {access_token}"},
@@ -207,17 +245,23 @@ class GoogleOAuthConnector:
             },
         )
         if response.status_code >= 400:
-            raise GoogleConnectorError(f"Failed to fetch contacts: {response.status_code}.")
+            raise GoogleConnectorError(
+                f"Failed to fetch contacts: {response.status_code}."
+            )
         return response.json().get("connections", [])
 
-    async def _fetch_gmail_messages(self, *, client: httpx.AsyncClient, access_token: str) -> list[dict[str, Any]]:
+    async def _fetch_gmail_messages(
+        self, *, client: httpx.AsyncClient, access_token: str
+    ) -> list[dict[str, Any]]:
         list_response = await client.get(
             GOOGLE_GMAIL_LIST_URL,
             headers={"Authorization": f"Bearer {access_token}"},
             params={"maxResults": 25},
         )
         if list_response.status_code >= 400:
-            raise GoogleConnectorError(f"Failed to list gmail messages: {list_response.status_code}.")
+            raise GoogleConnectorError(
+                f"Failed to list gmail messages: {list_response.status_code}."
+            )
         message_refs = list_response.json().get("messages", [])
         if not message_refs:
             return []
@@ -233,12 +277,16 @@ class GoogleOAuthConnector:
                 return {"id": message_id}
             return detail_response.json()
 
-        tasks = [fetch_message_detail(item["id"]) for item in message_refs if item.get("id")]
+        tasks = [
+            fetch_message_detail(item["id"]) for item in message_refs if item.get("id")
+        ]
         if not tasks:
             return []
         return await asyncio.gather(*tasks)
 
-    async def _fetch_calendar_events(self, *, client: httpx.AsyncClient, access_token: str) -> list[dict[str, Any]]:
+    async def _fetch_calendar_events(
+        self, *, client: httpx.AsyncClient, access_token: str
+    ) -> list[dict[str, Any]]:
         response = await client.get(
             GOOGLE_CALENDAR_EVENTS_URL,
             headers={"Authorization": f"Bearer {access_token}"},
@@ -249,33 +297,45 @@ class GoogleOAuthConnector:
             },
         )
         if response.status_code >= 400:
-            raise GoogleConnectorError(f"Failed to fetch calendar events: {response.status_code}.")
+            raise GoogleConnectorError(
+                f"Failed to fetch calendar events: {response.status_code}."
+            )
         return response.json().get("items", [])
 
-    def _normalize_contacts_payload(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    def _normalize_contacts_payload(
+        self, payload: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         if "connections" in payload and isinstance(payload["connections"], list):
             return payload["connections"]
         if "contacts" in payload and isinstance(payload["contacts"], list):
             return payload["contacts"]
         if payload:
             return [payload]
-        raise GoogleConnectorError("Mock contacts payload must contain 'connections' or contact object data.")
+        raise GoogleConnectorError(
+            "Mock contacts payload must contain 'connections' or contact object data."
+        )
 
     def _normalize_gmail_payload(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         if "messages" in payload and isinstance(payload["messages"], list):
             return payload["messages"]
         if payload:
             return [payload]
-        raise GoogleConnectorError("Mock gmail payload must contain 'messages' or message object data.")
+        raise GoogleConnectorError(
+            "Mock gmail payload must contain 'messages' or message object data."
+        )
 
-    def _normalize_calendar_payload(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    def _normalize_calendar_payload(
+        self, payload: dict[str, Any]
+    ) -> list[dict[str, Any]]:
         if "items" in payload and isinstance(payload["items"], list):
             return payload["items"]
         if "events" in payload and isinstance(payload["events"], list):
             return payload["events"]
         if payload:
             return [payload]
-        raise GoogleConnectorError("Mock calendar payload must contain 'items' or event object data.")
+        raise GoogleConnectorError(
+            "Mock calendar payload must contain 'items' or event object data."
+        )
 
     def _to_contact_events(
         self,
@@ -340,7 +400,9 @@ class GoogleOAuthConnector:
         output: list[SourceEvent] = []
         for item in events:
             event_id = item.get("id") or f"calendar_{uuid4().hex}"
-            occurred_at = _parse_iso_datetime(item.get("updated") or item.get("created"))
+            occurred_at = _parse_iso_datetime(
+                item.get("updated") or item.get("created")
+            )
             output.append(
                 SourceEvent(
                     tenant_id=context.tenant_id,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,7 +29,9 @@ class SearchDocumentStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def persist_documents(self, documents: list[SemanticDocument]) -> SearchDocumentPersistResult:
+    def persist_documents(
+        self, documents: list[SemanticDocument]
+    ) -> SearchDocumentPersistResult:
         raise NotImplementedError
 
 
@@ -74,7 +75,9 @@ class SqliteSearchDocumentStore(SearchDocumentStore):
             )
             conn.commit()
 
-    def persist_documents(self, documents: list[SemanticDocument]) -> SearchDocumentPersistResult:
+    def persist_documents(
+        self, documents: list[SemanticDocument]
+    ) -> SearchDocumentPersistResult:
         if not documents:
             return SearchDocumentPersistResult(0, 0, 0)
         stored = 0
@@ -136,14 +139,16 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
     def _url(self, table: str) -> str:
         return f"{self._supabase_url}/rest/v1/{table}"
 
-    def _bulk_resolve_entity_ids(self, tenant_id: str, emails: list[str]) -> dict[str, str]:
+    def _bulk_resolve_entity_ids(
+        self, tenant_id: str, emails: list[str]
+    ) -> dict[str, str]:
         """Return {primary_email -> entity_id} for all given emails in one GET."""
         if not emails:
             return {}
         unique_emails = list(set(emails))
         result: dict[str, str] = {}
         for i in range(0, len(unique_emails), 50):
-            chunk = unique_emails[i:i + 50]
+            chunk = unique_emails[i : i + 50]
             response = httpx.get(
                 self._url("entities"),
                 headers=self._base_headers,
@@ -158,14 +163,19 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
                 raise RuntimeError(
                     f"Supabase entities bulk lookup failed ({response.status_code}): {response.text}"
                 )
-            result.update({row["primary_email"]: str(row["entity_id"]) for row in response.json()})
+            result.update(
+                {row["primary_email"]: str(row["entity_id"]) for row in response.json()}
+            )
         return result
 
-    def persist_documents(self, documents: list[SemanticDocument]) -> SearchDocumentPersistResult:
+    def persist_documents(
+        self, documents: list[SemanticDocument]
+    ) -> SearchDocumentPersistResult:
         if not documents:
             return SearchDocumentPersistResult(0, 0, 0)
 
         from collections import defaultdict
+
         by_tenant: dict[str, list[SemanticDocument]] = defaultdict(list)
         for doc in documents:
             by_tenant[doc.tenant_id].append(doc)
@@ -203,10 +213,13 @@ class SupabaseSearchDocumentStore(SearchDocumentStore):
         if payload:
             # We chunk the UPSERTs to stay comfortably within limits
             for i in range(0, len(payload), 500):
-                chunk = payload[i:i + 500]
+                chunk = payload[i : i + 500]
                 response = httpx.post(
                     self._url("search_documents"),
-                    headers={**self._base_headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+                    headers={
+                        **self._base_headers,
+                        "Prefer": "resolution=merge-duplicates,return=minimal",
+                    },
                     params={"on_conflict": "tenant_id,entity_id,doc_type,content"},
                     json=chunk,
                     timeout=30.0,

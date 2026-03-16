@@ -29,7 +29,9 @@ def _normalize_contact(event: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(event.get("normalized", {}))
     emails = normalized.get("emails", [])
     if isinstance(emails, list):
-        normalized["emails"] = sorted({str(email).strip().lower() for email in emails if str(email).strip()})
+        normalized["emails"] = sorted(
+            {str(email).strip().lower() for email in emails if str(email).strip()}
+        )
     normalized["company"] = _normalize_company(normalized.get("company"))
     normalized["title"] = _normalize_title(normalized.get("title"))
 
@@ -72,7 +74,11 @@ def _normalize_calendar_event(event: dict[str, Any]) -> dict[str, Any]:
     attendee_emails = normalized.get("attendee_emails", [])
     if isinstance(attendee_emails, list):
         normalized["attendee_emails"] = sorted(
-            {str(email).strip().lower() for email in attendee_emails if str(email).strip()}
+            {
+                str(email).strip().lower()
+                for email in attendee_emails
+                if str(email).strip()
+            }
         )
 
     enriched = dict(event)
@@ -83,7 +89,9 @@ def _normalize_calendar_event(event: dict[str, Any]) -> dict[str, Any]:
     return enriched
 
 
-def clean_and_enrich_events(validation_result_payload: dict[str, Any]) -> CleaningEnrichmentResult:
+def clean_and_enrich_events(
+    validation_result_payload: dict[str, Any],
+) -> CleaningEnrichmentResult:
     valid_events = list(validation_result_payload.get("parsed_events", []))
     output: list[dict[str, Any]] = []
     for event in valid_events:

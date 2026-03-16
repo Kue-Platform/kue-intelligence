@@ -13,7 +13,9 @@ def _state(tenant_id: str, user_id: str) -> str:
 
 
 def test_google_oauth_callback_success_query_tenant_user() -> None:
-    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher("evt_stage_123")
+    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(
+        "evt_stage_123"
+    )
     client = TestClient(app)
 
     response = client.get(
@@ -39,7 +41,9 @@ def test_google_oauth_callback_success_query_tenant_user() -> None:
 
 
 def test_google_oauth_callback_success_state_resolution() -> None:
-    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher("evt_stage_abc")
+    app.dependency_overrides[get_inngest_dispatcher] = lambda: _fake_dispatcher(
+        "evt_stage_abc"
+    )
     client = TestClient(app)
 
     response = client.get(

@@ -40,6 +40,12 @@ class SourceConnectionStore(ABC):
     def upsert_connections(self, records: list[SourceConnectionRecord]) -> int:
         raise NotImplementedError
 
+    @abstractmethod
+    def get_connections_for_user(
+        self, tenant_id: str, user_id: str
+    ) -> list[SourceConnectionRecord]:
+        raise NotImplementedError
+
 
 class SqliteSourceConnectionStore(SourceConnectionStore):
     def __init__(self, db_path: str) -> None:
@@ -109,7 +115,9 @@ class SqliteSourceConnectionStore(SourceConnectionStore):
                             rec.external_account_id,
                             json.dumps(rec.scopes, ensure_ascii=True),
                             json.dumps(rec.token_json, ensure_ascii=True),
-                            rec.token_expires_at.isoformat() if rec.token_expires_at else None,
+                            rec.token_expires_at.isoformat()
+                            if rec.token_expires_at
+                            else None,
                             rec.status,
                             rec.last_sync_at.isoformat() if rec.last_sync_at else None,
                             rec.last_error,
@@ -118,6 +126,48 @@ class SqliteSourceConnectionStore(SourceConnectionStore):
                     )
                 conn.commit()
         return len(records)
+
+    def get_connections_for_user(
+        self, tenant_id: str, user_id: str
+    ) -> list[SourceConnectionRecord]:
+        with self._lock:
+            with get_connection(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    """
+                    SELECT tenant_id, user_id, source, external_account_id,
+                           scopes_json, token_json, token_expires_at, status,
+                           last_sync_at, last_error
+                    FROM source_connections
+                    WHERE tenant_id = ? AND user_id = ? AND status = 'active'
+                    """,
+                    (tenant_id, user_id),
+                )
+                rows = cursor.fetchall()
+        result: list[SourceConnectionRecord] = []
+        for row in rows:
+            expires_raw = row["token_expires_at"]
+            token_expires_at: datetime | None = None
+            if expires_raw:
+                try:
+                    from app.ingestion.canonical_store import _parse_iso_datetime
+
+                    token_expires_at = _parse_iso_datetime(str(expires_raw))
+                except Exception:
+                    pass
+            result.append(
+                SourceConnectionRecord(
+                    tenant_id=str(row["tenant_id"]),
+                    user_id=str(row["user_id"]),
+                    source=IngestionSource(str(row["source"])),
+                    external_account_id=str(row["external_account_id"]),
+                    scopes=json.loads(str(row["scopes_json"])),
+                    token_json=json.loads(str(row["token_json"])),
+                    token_expires_at=token_expires_at,
+                    status=str(row["status"]),
+                )
+            )
+        return result
 
 
 class SupabaseSourceConnectionStore(SourceConnectionStore):
@@ -149,9 +199,13 @@ class SupabaseSourceConnectionStore(SourceConnectionStore):
                 "external_account_id": rec.external_account_id,
                 "scopes": rec.scopes,
                 "token_json": rec.token_json,
-                "token_expires_at": rec.token_expires_at.isoformat() if rec.token_expires_at else None,
+                "token_expires_at": rec.token_expires_at.isoformat()
+                if rec.token_expires_at
+                else None,
                 "status": rec.status,
-                "last_sync_at": rec.last_sync_at.isoformat() if rec.last_sync_at else None,
+                "last_sync_at": rec.last_sync_at.isoformat()
+                if rec.last_sync_at
+                else None,
                 "last_error": rec.last_error,
                 "updated_at": datetime.now(UTC).isoformat(),
             }
@@ -169,6 +223,11 @@ class SupabaseSourceConnectionStore(SourceConnectionStore):
                 f"Supabase source_connections upsert failed ({response.status_code}): {response.text}"
             )
         return len(records)
+
+    def get_connections_for_user(
+        self, tenant_id: str, user_id: str
+    ) -> list[SourceConnectionRecord]:
+        raise NotImplementedError("Supabase source connection store is not used")
 
 
 def create_source_connection_store(settings: Settings) -> SourceConnectionStore:

@@ -46,7 +46,9 @@ class InMemoryCacheRegistry:
                 expires_at=now + timedelta(seconds=ttl_seconds),
             )
 
-    def get(self, *, namespace: str, key: str, version: str = "v1") -> dict[str, Any] | None:
+    def get(
+        self, *, namespace: str, key: str, version: str = "v1"
+    ) -> dict[str, Any] | None:
         now = datetime.now(UTC)
         with self._lock:
             self._evict_locked(now)

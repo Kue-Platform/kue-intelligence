@@ -5,12 +5,18 @@ from typing import Any
 from app.core.config import settings
 from app.ingestion.canonical_store import create_canonical_event_store
 from app.ingestion.enrichment import clean_and_enrich_events
-from app.ingestion.entity_resolution import extract_entity_candidates, merge_entity_candidates
+from app.ingestion.entity_resolution import (
+    extract_entity_candidates,
+    merge_entity_candidates,
+)
 from app.ingestion.entity_store import create_entity_store
 from app.ingestion.graph_projection import create_graph_projection_service
 from app.ingestion.graph_store import create_graph_store
 from app.ingestion.metadata_extraction import extract_metadata_candidates
-from app.ingestion.relationship_extraction import compute_relationship_strength, extract_interactions
+from app.ingestion.relationship_extraction import (
+    compute_relationship_strength,
+    extract_interactions,
+)
 from app.ingestion.relationship_store import create_relationship_store
 from app.ingestion.semantic_prep import build_semantic_documents
 from app.ingestion.search_document_store import create_search_document_store
@@ -25,7 +31,10 @@ from app.ingestion.search_index_store import create_search_index_store
 from app.ingestion.google_connector import GoogleOAuthConnector, GoogleOAuthContext
 from app.ingestion.parsers import parse_raw_events
 from app.ingestion.raw_store import create_raw_event_store
-from app.ingestion.source_connection_store import SourceConnectionRecord, create_source_connection_store
+from app.ingestion.source_connection_store import (
+    SourceConnectionRecord,
+    create_source_connection_store,
+)
 from app.ingestion.validators import validate_parsed_events
 from app.schemas import GoogleMockSourceType, IngestionSource, SourceEvent
 
@@ -47,7 +56,9 @@ def _validate_oauth_payload(data: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
-async def _fetch_google_source_events_from_oauth(data: dict[str, Any]) -> dict[str, Any]:
+async def _fetch_google_source_events_from_oauth(
+    data: dict[str, Any],
+) -> dict[str, Any]:
     """Fetch Google source events and persist them before pipeline execution."""
     connector = GoogleOAuthConnector()
     context = GoogleOAuthContext(
@@ -100,7 +111,9 @@ def _fetch_google_source_events_from_mock(data: dict[str, Any]) -> dict[str, Any
     return {"count": len(source_events), "pre_stored": True}
 
 
-def _persist_raw_events(run_id: str, events_payload: list[dict[str, Any]]) -> dict[str, Any]:
+def _persist_raw_events(
+    run_id: str, events_payload: list[dict[str, Any]]
+) -> dict[str, Any]:
     events = [SourceEvent.model_validate(item) for item in events_payload]
     store = create_raw_event_store(settings)
     result = store.persist_source_events(events, run_id=run_id, ingest_version="v1")
@@ -126,7 +139,9 @@ def _fetch_raw_events(trace_id: str) -> dict[str, Any]:
 def _parse_raw_events(raw_events_payload: list[dict[str, Any]]) -> dict[str, Any]:
     from app.schemas import RawCapturedEvent
 
-    typed_raw_events = [RawCapturedEvent.model_validate(item) for item in raw_events_payload]
+    typed_raw_events = [
+        RawCapturedEvent.model_validate(item) for item in raw_events_payload
+    ]
     parse_result = parse_raw_events(typed_raw_events)
     return {
         "parsed_count": len(parse_result.parsed_events),
@@ -157,7 +172,9 @@ def _parse_raw_events(raw_events_payload: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
-def _persist_canonical(run_id: str, parsed_payload: dict[str, Any], parser_version: str) -> dict[str, Any]:
+def _persist_canonical(
+    run_id: str, parsed_payload: dict[str, Any], parser_version: str
+) -> dict[str, Any]:
     from datetime import datetime
 
     from app.ingestion.parsers import ParsedCanonicalEvent
@@ -219,7 +236,10 @@ def _persist_relationships(
     extract_payload: dict[str, Any],
     strength_payload: dict[str, Any],
 ) -> dict[str, Any]:
-    from app.ingestion.relationship_extraction import InteractionCandidate, RelationshipAggregate
+    from app.ingestion.relationship_extraction import (
+        InteractionCandidate,
+        RelationshipAggregate,
+    )
 
     interactions = [
         InteractionCandidate.model_validate(item)
@@ -251,17 +271,17 @@ def _process_enrichment(enrichment_payload: dict[str, Any]) -> dict[str, Any]:
     relationships = compute_relationship_strength(interactions.model_dump(mode="json"))
 
     return {
-        "merge_result":    entity_merged.model_dump(mode="json"),
+        "merge_result": entity_merged.model_dump(mode="json"),
         "metadata_result": metadata.model_dump(mode="json"),
         "semantic_result": semantic.model_dump(mode="json"),
-        "extract_result":  interactions.model_dump(mode="json"),
+        "extract_result": interactions.model_dump(mode="json"),
         "strength_result": relationships.model_dump(mode="json"),
         "entity_candidate_count": entity_exact.candidate_count,
-        "resolved_count":         entity_merged.resolved_count,
-        "metadata_count":         metadata.candidate_count,
-        "document_count":         semantic.document_count,
-        "interaction_count":      interactions.interaction_count,
-        "relationship_count":     relationships.relationship_count,
+        "resolved_count": entity_merged.resolved_count,
+        "metadata_count": metadata.candidate_count,
+        "document_count": semantic.document_count,
+        "interaction_count": interactions.interaction_count,
+        "relationship_count": relationships.relationship_count,
     }
 
 
@@ -305,15 +325,19 @@ def _generate_embedding_vectors(semantic_payload: dict[str, Any]) -> dict[str, A
     generated = generate_embeddings(requests)
 
     sps = _step_payload_store()
-    vectors_ref = sps.write(run_id, "embedding_generate", {
-        "records": [item.model_dump(mode="json") for item in generated.generated],
-    })
+    vectors_ref = sps.write(
+        run_id,
+        "embedding_generate",
+        {
+            "records": [item.model_dump(mode="json") for item in generated.generated],
+        },
+    )
 
     return {
-        "run_id":          run_id,
+        "run_id": run_id,
         "generated_count": generated.generated_count,
-        "total_count":     generated.generated_count,
-        "vectors_ref":     vectors_ref,
+        "total_count": generated.generated_count,
+        "vectors_ref": vectors_ref,
     }
 
 
@@ -370,7 +394,9 @@ def _persist_search_index(signals_payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict[str, Any]:
+def _ingest_and_process(
+    trace_id: str, run_id: str, parser_version: str
+) -> dict[str, Any]:
     """Fetch, canonicalize, enrich, and persist intermediate outputs."""
     raw = _fetch_raw_events(trace_id)
     raw_events = list(raw.get("events", []))
@@ -387,32 +413,36 @@ def _ingest_and_process(trace_id: str, run_id: str, parser_version: str) -> dict
     invalid_events = list(validated.get("invalid_events", []))
 
     sps = _step_payload_store()
-    enrichment_ref = sps.write(run_id, "ingest_and_process", {
-        "merge_result":    process["merge_result"],
-        "metadata_result": process["metadata_result"],
-        "semantic_result": process["semantic_result"],
-        "extract_result":  process["extract_result"],
-        "strength_result": process["strength_result"],
-    })
+    enrichment_ref = sps.write(
+        run_id,
+        "ingest_and_process",
+        {
+            "merge_result": process["merge_result"],
+            "metadata_result": process["metadata_result"],
+            "semantic_result": process["semantic_result"],
+            "extract_result": process["extract_result"],
+            "strength_result": process["strength_result"],
+        },
+    )
 
     del enriched, validated
 
     return {
-        "raw_count":      raw.get("count", 0),
-        "parsed_count":   parsed.get("parsed_count", 0),
-        "failed_count":   parsed.get("failed_count", 0),
-        "valid_count":    valid_count,
-        "invalid_count":  invalid_count,
+        "raw_count": raw.get("count", 0),
+        "parsed_count": parsed.get("parsed_count", 0),
+        "failed_count": parsed.get("failed_count", 0),
+        "valid_count": valid_count,
+        "invalid_count": invalid_count,
         "invalid_events": invalid_events,
         "enriched_count": process.get("entity_candidate_count", 0),
         **canonical,
         "enrichment_ref": enrichment_ref,
         "entity_candidate_count": process["entity_candidate_count"],
-        "resolved_count":         process["resolved_count"],
-        "metadata_count":         process["metadata_count"],
-        "document_count":         process["document_count"],
-        "interaction_count":      process["interaction_count"],
-        "relationship_count":     process["relationship_count"],
+        "resolved_count": process["resolved_count"],
+        "metadata_count": process["metadata_count"],
+        "document_count": process["document_count"],
+        "interaction_count": process["interaction_count"],
+        "relationship_count": process["relationship_count"],
     }
 
 
@@ -420,9 +450,12 @@ def _graph_prepare(tenant_id: str, user_id: str, trace_id: str) -> dict[str, Any
     graph_store = create_graph_store(settings)
     schema_result = graph_store.ensure_schema()
     service = create_graph_projection_service(settings)
-    snapshot = service.prepare_snapshot(tenant_id=tenant_id, user_id=user_id, trace_id=trace_id)
+    snapshot = service.prepare_snapshot(
+        tenant_id=tenant_id, user_id=user_id, trace_id=trace_id
+    )
     return {
-        "enabled": bool(snapshot.get("enabled", False)) and bool(schema_result.get("enabled", False)),
+        "enabled": bool(snapshot.get("enabled", False))
+        and bool(schema_result.get("enabled", False)),
         "schema": schema_result,
         "batch_stats": snapshot.get("batch_stats", {}),
         "snapshot": snapshot,
@@ -490,7 +523,9 @@ def _graph_finalize(
     }
 
 
-def _resolve_source_hint(data: dict[str, Any], source_events_payload: list[dict[str, Any]]) -> IngestionSource | None:
+def _resolve_source_hint(
+    data: dict[str, Any], source_events_payload: list[dict[str, Any]]
+) -> IngestionSource | None:
     if source_events_payload:
         first_source = source_events_payload[0].get("source")
         if first_source:
@@ -533,7 +568,9 @@ def _ensure_pipeline_run(
     source_event_id = None
     if source_events_payload:
         source_event_id = str(source_events_payload[0].get("source_event_id") or "")
-    source_event_id = source_event_id or (str(data.get("source_event_id")) if data.get("source_event_id") else None)
+    source_event_id = source_event_id or (
+        str(data.get("source_event_id")) if data.get("source_event_id") else None
+    )
 
     store = _pipeline_store()
     store.ensure_tenant_user(tenant_id, user_id)
@@ -546,4 +583,10 @@ def _ensure_pipeline_run(
         source_event_id=source_event_id,
         metadata={"event_name": trigger_type},
     )
-    return {"run_id": run_id, "trace_id": trace_id, "tenant_id": tenant_id, "user_id": user_id, "pre_stored": False}
+    return {
+        "run_id": run_id,
+        "trace_id": trace_id,
+        "tenant_id": tenant_id,
+        "user_id": user_id,
+        "pre_stored": False,
+    }

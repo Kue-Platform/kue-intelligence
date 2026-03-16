@@ -53,7 +53,11 @@ def _build_pipeline_summary(
             "raw_count": ingest_result.get("raw_count", 0),
             "parsed_count": ingest_result.get("parsed_count", 0),
             "failed_count": ingest_result.get("failed_count", 0),
-            **{k: v for k, v in ingest_result.items() if k in ("stored_count", "captured_at", "store")},
+            **{
+                k: v
+                for k, v in ingest_result.items()
+                if k in ("stored_count", "captured_at", "store")
+            },
         },
         "validation": {
             "valid_count": ingest_result.get("valid_count", 0),
@@ -109,53 +113,84 @@ async def _run_post_ingest_steps(
 ) -> dict[str, Any]:
     """Execute all pipeline steps after ingest_and_process and return their results."""
     enrichment_slices = _step_payload_store().read(ingest_result["enrichment_ref"])
-    semantic_result_with_run_id = {**enrichment_slices["semantic_result"], "run_id": run_id}
+    semantic_result_with_run_id = {
+        **enrichment_slices["semantic_result"],
+        "run_id": run_id,
+    }
 
     entity_persist = await ctx.step.run(
         "stage.entity_resolution.layer.persist_entities",
-        _layer_entity_persist, run_id, enrichment_slices["merge_result"],
+        _layer_entity_persist,
+        run_id,
+        enrichment_slices["merge_result"],
     )
     metadata_persist = await ctx.step.run(
         "stage.metadata_extraction.layer.persist_metadata",
-        _layer_persist_metadata, run_id, enrichment_slices["metadata_result"],
+        _layer_persist_metadata,
+        run_id,
+        enrichment_slices["metadata_result"],
     )
     semantic_persist = await ctx.step.run(
         "stage.semantic_prep.layer.persist_search_documents",
-        _layer_persist_semantic_documents, run_id, enrichment_slices["semantic_result"],
+        _layer_persist_semantic_documents,
+        run_id,
+        enrichment_slices["semantic_result"],
     )
     embedding_vectors = await ctx.step.run(
         "stage.embedding.layer.generate_vectors",
-        _layer_embedding_generate, run_id, semantic_result_with_run_id,
+        _layer_embedding_generate,
+        run_id,
+        semantic_result_with_run_id,
     )
     embedding_persist = await ctx.step.run(
         "stage.embedding.layer.persist_vectors",
-        _layer_embedding_persist, run_id, embedding_vectors,
+        _layer_embedding_persist,
+        run_id,
+        embedding_vectors,
     )
     signals_result = await ctx.step.run(
         "stage.search_indexing.layer.build_signals",
-        _layer_build_signals, run_id, embedding_vectors,
+        _layer_build_signals,
+        run_id,
+        embedding_vectors,
     )
     search_index_result = await ctx.step.run(
         "stage.search_indexing.layer.index_health_check",
-        _layer_persist_search_index, run_id, signals_result,
+        _layer_persist_search_index,
+        run_id,
+        signals_result,
     )
     relationship_persist = await ctx.step.run(
         "stage.relationship_extraction.layer.persist_relationships",
-        _layer_persist_relationships, run_id,
-        enrichment_slices["extract_result"], enrichment_slices["strength_result"],
+        _layer_persist_relationships,
+        run_id,
+        enrichment_slices["extract_result"],
+        enrichment_slices["strength_result"],
     )
     graph_prepare = await ctx.step.run(
         "stage.graph_projection.layer.prepare",
-        _layer_graph_prepare, run_id, tenant_id, user_id, trace_id,
+        _layer_graph_prepare,
+        run_id,
+        tenant_id,
+        user_id,
+        trace_id,
     )
     graph_projection = await ctx.step.run(
         "stage.graph_projection.layer.project",
-        _layer_project_graph, run_id, graph_prepare,
+        _layer_project_graph,
+        run_id,
+        graph_prepare,
     )
     graph_finalize = await ctx.step.run(
         "stage.graph_projection.layer.finalize",
-        _layer_graph_finalize, run_id, trace_id, tenant_id, user_id,
-        graph_prepare, graph_projection["node_result"], graph_projection["edge_result"],
+        _layer_graph_finalize,
+        run_id,
+        trace_id,
+        tenant_id,
+        user_id,
+        graph_prepare,
+        graph_projection["node_result"],
+        graph_projection["edge_result"],
     )
 
     return {
@@ -183,13 +218,18 @@ async def _run_pipeline_core(
 ) -> dict[str, Any]:
     run_info = await ctx.step.run(
         "stage.orchestration.layer.ensure_run",
-        _ensure_pipeline_run, data, trigger_type, source_events_payload,
+        _ensure_pipeline_run,
+        data,
+        trigger_type,
+        source_events_payload,
     )
     run_id = str(run_info["run_id"])
     trace_id = str(run_info["trace_id"])
     tenant_id = str(run_info["tenant_id"])
     user_id = str(run_info["user_id"])
-    pre_stored = bool(run_info.get("pre_stored", False)) or bool(data.get("pre_stored", False))
+    pre_stored = bool(run_info.get("pre_stored", False)) or bool(
+        data.get("pre_stored", False)
+    )
 
     try:
         if pre_stored:
@@ -202,32 +242,50 @@ async def _run_pipeline_core(
         else:
             await ctx.step.run(
                 "stage.raw_capture.layer.validate",
-                _layer_validate_source_events, run_id, source_events_payload,
+                _layer_validate_source_events,
+                run_id,
+                source_events_payload,
             )
             raw_result = await ctx.step.run(
                 "stage.raw_capture.layer.persist",
-                _layer_persist_raw_events, run_id, source_events_payload,
+                _layer_persist_raw_events,
+                run_id,
+                source_events_payload,
             )
 
         ingest_result = await ctx.step.run(
             "stage.canonicalization.layer.ingest_and_process",
-            _layer_ingest_and_process, run_id, trace_id, parser_version,
+            _layer_ingest_and_process,
+            run_id,
+            trace_id,
+            parser_version,
         )
 
         steps = await _run_post_ingest_steps(
             ctx,
-            run_id=run_id, trace_id=trace_id,
-            tenant_id=tenant_id, user_id=user_id,
+            run_id=run_id,
+            trace_id=trace_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
             ingest_result=ingest_result,
         )
 
         summary = _build_pipeline_summary(
-            trace_id=trace_id, run_id=run_id,
-            raw_result=raw_result, ingest_result=ingest_result,
+            trace_id=trace_id,
+            run_id=run_id,
+            raw_result=raw_result,
+            ingest_result=ingest_result,
             **steps,
         )
-        await ctx.step.run("stage.orchestration.layer.complete_run", _mark_run_succeeded, run_id, summary)
+        await ctx.step.run(
+            "stage.orchestration.layer.complete_run",
+            _mark_run_succeeded,
+            run_id,
+            summary,
+        )
         return summary
     except Exception as exc:
-        await ctx.step.run("stage.orchestration.layer.fail_run", _mark_run_failed, run_id, exc)
+        await ctx.step.run(
+            "stage.orchestration.layer.fail_run", _mark_run_failed, run_id, exc
+        )
         raise

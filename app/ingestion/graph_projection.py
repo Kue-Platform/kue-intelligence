@@ -42,16 +42,26 @@ class GraphProjectionService:
 
     @property
     def _enabled(self) -> bool:
-        return bool(self.settings.supabase_url and (self.settings.supabase_service_role_key or self.settings.supabase_anon_key))
+        return bool(
+            self.settings.supabase_url
+            and (
+                self.settings.supabase_service_role_key
+                or self.settings.supabase_anon_key
+            )
+        )
 
     @property
     def _api_key(self) -> str:
-        return self.settings.supabase_service_role_key or self.settings.supabase_anon_key
+        return (
+            self.settings.supabase_service_role_key or self.settings.supabase_anon_key
+        )
 
     def _url(self, table: str) -> str:
         return f"{self.settings.supabase_url.rstrip('/')}/rest/v1/{table}"
 
-    def _headers(self, prefer_repr: bool = False, upsert: bool = False) -> dict[str, str]:
+    def _headers(
+        self, prefer_repr: bool = False, upsert: bool = False
+    ) -> dict[str, str]:
         headers = {
             "apikey": self._api_key,
             "Authorization": f"Bearer {self._api_key}",
@@ -114,7 +124,9 @@ class GraphProjectionService:
                     topics.append({"name": name, "source": key})
         return topics
 
-    def prepare_snapshot(self, *, tenant_id: str, user_id: str, trace_id: str) -> dict[str, Any]:
+    def prepare_snapshot(
+        self, *, tenant_id: str, user_id: str, trace_id: str
+    ) -> dict[str, Any]:
         if not self._enabled:
             return {
                 "enabled": False,
@@ -176,8 +188,14 @@ class GraphProjectionService:
                 continue
             email = _norm_text(row.get("primary_email"))
             domain = _email_domain(email)
-            metadata_json = row.get("metadata_json") if isinstance(row.get("metadata_json"), dict) else {}
-            seniority = _norm_text(metadata_json.get("seniority") or row.get("title_norm"))
+            metadata_json = (
+                row.get("metadata_json")
+                if isinstance(row.get("metadata_json"), dict)
+                else {}
+            )
+            seniority = _norm_text(
+                metadata_json.get("seniority") or row.get("title_norm")
+            )
             person_nodes.append(
                 {
                     "tenant_id": tenant_id,
@@ -205,8 +223,10 @@ class GraphProjectionService:
                         "industry": None,
                         "size": None,
                         "location": _norm_text(row.get("location_norm")),
-                        "created_at": _norm_text(row.get("created_at")) or _utc_now_iso(),
-                        "updated_at": _norm_text(row.get("updated_at")) or _utc_now_iso(),
+                        "created_at": _norm_text(row.get("created_at"))
+                        or _utc_now_iso(),
+                        "updated_at": _norm_text(row.get("updated_at"))
+                        or _utc_now_iso(),
                     },
                 )
                 if not company.get("domain") and domain:
@@ -222,7 +242,8 @@ class GraphProjectionService:
                         "start_date": None,
                         "end_date": None,
                         "is_current": True,
-                        "updated_at": _norm_text(row.get("updated_at")) or _utc_now_iso(),
+                        "updated_at": _norm_text(row.get("updated_at"))
+                        or _utc_now_iso(),
                     }
                 )
 
@@ -282,7 +303,8 @@ class GraphProjectionService:
                         "user_id": uid,
                         "company_id": company_domain_to_id[domain.lower()],
                         "role": _norm_text(row.get("role")) or "member",
-                        "joined_at": _norm_text(row.get("created_at")) or _utc_now_iso(),
+                        "joined_at": _norm_text(row.get("created_at"))
+                        or _utc_now_iso(),
                     }
                 )
 
@@ -292,14 +314,25 @@ class GraphProjectionService:
             to = _norm_text(row.get("to_entity_id"))
             if not frm or not to:
                 continue
-            evidence = row.get("evidence_json") if isinstance(row.get("evidence_json"), list) else []
-            channels = sorted({str(item.get("touchpoint_type")) for item in evidence if isinstance(item, dict) and item.get("touchpoint_type")})
+            evidence = (
+                row.get("evidence_json")
+                if isinstance(row.get("evidence_json"), list)
+                else []
+            )
+            channels = sorted(
+                {
+                    str(item.get("touchpoint_type"))
+                    for item in evidence
+                    if isinstance(item, dict) and item.get("touchpoint_type")
+                }
+            )
             knows_edges.append(
                 {
                     "tenant_id": tenant_id,
                     "from_entity_id": frm,
                     "to_entity_id": to,
-                    "relationship_type": _norm_text(row.get("relationship_type")) or "direct",
+                    "relationship_type": _norm_text(row.get("relationship_type"))
+                    or "direct",
                     "strength": float(row.get("strength") or 0.0),
                     "interaction_count": int(row.get("interaction_count") or 0),
                     "first_interaction_at": _norm_text(row.get("first_interaction_at")),
@@ -317,14 +350,19 @@ class GraphProjectionService:
             if not actor or not target:
                 continue
             occurred = _norm_text(row.get("occurred_at")) or _utc_now_iso()
-            source_event_id = str(row.get("canonical_event_id") or row.get("raw_event_id") or f"evt_{hash((actor, target, occurred))}")
+            source_event_id = str(
+                row.get("canonical_event_id")
+                or row.get("raw_event_id")
+                or f"evt_{hash((actor, target, occurred))}"
+            )
             interacted_edges.append(
                 {
                     "tenant_id": tenant_id,
                     "actor_entity_id": actor,
                     "target_entity_id": target,
                     "channel": _norm_text(row.get("source")) or "unknown",
-                    "interaction_type": _norm_text(row.get("touchpoint_type")) or "interaction",
+                    "interaction_type": _norm_text(row.get("touchpoint_type"))
+                    or "interaction",
                     "occurred_at": occurred,
                     "source_event_id": source_event_id,
                 }
@@ -367,7 +405,10 @@ class GraphProjectionService:
                         continue
                     score = likelihood * float(e2.get("strength") or 0.0)
                     current = best_paths.get(second_target)
-                    if current is None or float(current.get("intro_likelihood") or 0.0) < score:
+                    if (
+                        current is None
+                        or float(current.get("intro_likelihood") or 0.0) < score
+                    ):
                         best_paths[second_target] = {
                             "tenant_id": tenant_id,
                             "user_id": user_id,
@@ -500,12 +541,40 @@ class GraphProjectionService:
 
         # Deduplicate on (tenant_id, edge_type, edge_key) — the ON CONFLICT key.
         edge_configs = [
-            ("KNOWS", "knows_edges", lambda r: f"{r.get('from_entity_id')}->{r.get('to_entity_id')}:{r.get('relationship_type') or 'direct'}"),
-            ("INTERACTED_WITH", "interacted_edges", lambda r: f"{r.get('actor_entity_id')}->{r.get('target_entity_id')}:{r.get('source_event_id')}"),
-            ("WORKS_AT", "works_at_edges", lambda r: f"{r.get('entity_id')}->{r.get('company_id')}"),
-            ("MEMBER_OF", "member_of_edges", lambda r: f"{r.get('user_id')}->{r.get('company_id')}"),
-            ("HAS_TOPIC", "has_topic_edges", lambda r: f"{r.get('entity_id')}->{r.get('topic_id')}"),
-            ("INTRO_PATH", "intro_path_edges", lambda r: f"{r.get('user_id')}->{r.get('target_entity_id')}"),
+            (
+                "KNOWS",
+                "knows_edges",
+                lambda r: (
+                    f"{r.get('from_entity_id')}->{r.get('to_entity_id')}:{r.get('relationship_type') or 'direct'}"
+                ),
+            ),
+            (
+                "INTERACTED_WITH",
+                "interacted_edges",
+                lambda r: (
+                    f"{r.get('actor_entity_id')}->{r.get('target_entity_id')}:{r.get('source_event_id')}"
+                ),
+            ),
+            (
+                "WORKS_AT",
+                "works_at_edges",
+                lambda r: f"{r.get('entity_id')}->{r.get('company_id')}",
+            ),
+            (
+                "MEMBER_OF",
+                "member_of_edges",
+                lambda r: f"{r.get('user_id')}->{r.get('company_id')}",
+            ),
+            (
+                "HAS_TOPIC",
+                "has_topic_edges",
+                lambda r: f"{r.get('entity_id')}->{r.get('topic_id')}",
+            ),
+            (
+                "INTRO_PATH",
+                "intro_path_edges",
+                lambda r: f"{r.get('user_id')}->{r.get('target_entity_id')}",
+            ),
         ]
         deduped_edges: dict[tuple, dict] = {}
         for edge_type, key, key_fn in edge_configs:

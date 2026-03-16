@@ -61,7 +61,10 @@ def test_layer9_semantic_endpoint_persists_documents() -> None:
                     "payload": {
                         "headers": [
                             {"name": "Subject", "value": "Intro request"},
-                            {"name": "From", "value": "Alan Turing <alan@venturelabs.com>"},
+                            {
+                                "name": "From",
+                                "value": "Alan Turing <alan@venturelabs.com>",
+                            },
                             {"name": "To", "value": "Harun Rashid <harun@example.com>"},
                         ]
                     },

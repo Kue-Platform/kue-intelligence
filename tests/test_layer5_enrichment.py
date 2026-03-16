@@ -28,7 +28,9 @@ def test_layer5_enrichment_endpoint_returns_normalized_contact() -> None:
                     "resourceName": "people/c_l5",
                     "names": [{"displayName": "Layer Five"}],
                     "emailAddresses": [{"value": "LAYER.FIVE@EXAMPLE.COM"}],
-                    "organizations": [{"name": "stripe   ", "title": "engineering lead"}],
+                    "organizations": [
+                        {"name": "stripe   ", "title": "engineering lead"}
+                    ],
                 },
             )
         ]

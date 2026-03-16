@@ -30,7 +30,9 @@ def _detect_shape(payload: dict) -> str:
 def _validate_google_contacts(payload: dict) -> int:
     contacts = payload.get("contacts")
     if not isinstance(contacts, list) or not contacts:
-        raise ValueError("google_contacts payload must include a non-empty 'contacts' list")
+        raise ValueError(
+            "google_contacts payload must include a non-empty 'contacts' list"
+        )
     return len(contacts)
 
 
@@ -70,4 +72,3 @@ def trigger_mock_connector(
         records_detected=records_detected,
         payload_shape=_detect_shape(payload),
     )
-

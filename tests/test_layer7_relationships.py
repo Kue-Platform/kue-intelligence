@@ -37,7 +37,10 @@ def test_layer7_relationship_endpoint_builds_relationships() -> None:
                     "payload": {
                         "headers": [
                             {"name": "Subject", "value": "Intro to Rachel"},
-                            {"name": "From", "value": "Alan Turing <alan@venturelabs.com>"},
+                            {
+                                "name": "From",
+                                "value": "Alan Turing <alan@venturelabs.com>",
+                            },
                             {"name": "To", "value": "Harun Rashid <harun@example.com>"},
                         ]
                     },

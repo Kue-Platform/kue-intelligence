@@ -21,6 +21,7 @@ Backends
   • SupabaseStepPayloadStore  — used in production (supabase_url configured)
   • SqliteStepPayloadStore    — used locally / in tests
 """
+
 from __future__ import annotations
 
 import json
@@ -41,6 +42,7 @@ from app.core.config import Settings
 # Reference format helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_ref(run_id: str, step_name: str) -> str:
     """Build a compact string reference: ``run_id:step_name``."""
     return f"{run_id}:{step_name}"
@@ -52,7 +54,9 @@ def _parse_ref(ref: str) -> tuple[str, str]:
     Raises ValueError when the ref is malformed.
     """
     if ":" not in ref:
-        raise ValueError(f"Invalid step_ref — expected 'run_id:step_name', got: {ref!r}")
+        raise ValueError(
+            f"Invalid step_ref — expected 'run_id:step_name', got: {ref!r}"
+        )
     run_id, _, step_name = ref.partition(":")
     return run_id, step_name
 
@@ -60,6 +64,7 @@ def _parse_ref(ref: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # Abstract base
 # ---------------------------------------------------------------------------
+
 
 class StepPayloadStore(ABC):
     """Persistent store for intermediate Inngest step payloads."""
@@ -90,6 +95,7 @@ class StepPayloadStore(ABC):
 # ---------------------------------------------------------------------------
 # SQLite backend  (local dev / tests)
 # ---------------------------------------------------------------------------
+
 
 class SqliteStepPayloadStore(StepPayloadStore):
     """SQLite-backed step payload store for local development and tests."""
@@ -172,6 +178,7 @@ class SqliteStepPayloadStore(StepPayloadStore):
 # Supabase backend  (production)
 # ---------------------------------------------------------------------------
 
+
 class SupabaseStepPayloadStore(StepPayloadStore):
     """Supabase-backed step payload store for production."""
 
@@ -197,13 +204,16 @@ class SupabaseStepPayloadStore(StepPayloadStore):
         row = {
             "run_id": run_id,
             "step_name": step_name,
-            "payload_json": payload,   # stored as JSONB
+            "payload_json": payload,  # stored as JSONB
             "created_at": datetime.now(UTC).isoformat(),
         }
 
         response = httpx.post(
             self._rest_url(),
-            headers={**self._headers, "Prefer": "resolution=merge-duplicates,return=minimal"},
+            headers={
+                **self._headers,
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
             params={"on_conflict": "run_id,step_name"},
             json=[row],
             timeout=30.0,
@@ -273,6 +283,7 @@ class SupabaseStepPayloadStore(StepPayloadStore):
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
+
 
 def create_step_payload_store(settings: Settings) -> StepPayloadStore:
     return SqliteStepPayloadStore(db_path=settings.step_payloads_db_path)
